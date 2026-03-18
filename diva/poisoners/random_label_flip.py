@@ -1,10 +1,9 @@
 import numpy as np
-import pandas as pd
 from poisoners.base_poisoner import BasePoisoner
 
 class RandomLabelFlipPoisoner(BasePoisoner):
-    def __init__(self, spacing, poisoning_rate):
-        super().__init__(spacing, poisoning_rate)
+    def __init__(self, poisoning_rate):
+        super().__init__(poisoning_rate)
 
     def poison(self, dataset):
         poisoned_dataset = dataset.copy()

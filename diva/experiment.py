@@ -1,7 +1,10 @@
-from poisoners.random_label_flip import RandomLabelFlipPoisoner
-from helpers.dataset import generate_datasets, extract_complexity_measures
-
 import warnings
+
+from poisoners.alfa import ALFAPoisoner
+from helpers.dataset import generate_datasets, extract_complexity_measures
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from sklearn.ensemble import RandomForestClassifier
 
 warnings.filterwarnings("ignore")
 
@@ -20,14 +23,46 @@ class Experiment:
             self.complexity_measures.append(complexity)
 
         for dataset in self.datasets:
-            poisoner = RandomLabelFlipPoisoner(spacing=0.05, poisoning_rate=0.1)
+            poisoner = ALFAPoisoner(poisoning_rate=0.4)
             poisoned_dataset = poisoner.poison(dataset)
             self.poisoned_datasets.append(poisoned_dataset)
 
-        print("Original dataset:")
-        print(self.datasets[0].head())
-        print("\nPoisoned dataset:")
-        print(self.poisoned_datasets[0].head())
+        for i, poisoned_dataset in enumerate(self.poisoned_datasets):
+            original = self.datasets[i]
+
+            X_poisoned = poisoned_dataset.drop('y', axis=1)
+            y_poisoned = poisoned_dataset['y']
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_poisoned, y_poisoned, test_size=0.2, random_state=42
+            )
+
+            X_clean = original.drop('y', axis=1)
+            y_clean = original['y']
+
+            X_train_clean, X_test_clean, y_train_clean, y_test_clean = train_test_split(
+                X_clean, y_clean, test_size=0.2, random_state=42
+            )
+
+            poisoned_model = RandomForestClassifier(random_state=42)
+            poisoned_model.fit(X_train, y_train)
+
+            clean_model = RandomForestClassifier(random_state=42)
+            clean_model.fit(X_train_clean, y_train_clean)
+
+            poisoned_preds = poisoned_model.predict(X_test)
+            poisoned_preds_on_clean = poisoned_model.predict(X_test_clean)
+            clean_preds = clean_model.predict(X_test_clean)
+
+            poisoned_acc = accuracy_score(y_test, poisoned_preds)
+            poisoned_on_clean_acc = accuracy_score(y_test_clean, poisoned_preds_on_clean)
+            clean_acc = accuracy_score(y_test_clean, clean_preds)
+
+            print(f"Dataset {i+1}:")
+            print(f"  Complexity Measures: {self.complexity_measures[i]}")
+            print(f"  Poisoned Model Accuracy on Poisoned Data: {poisoned_acc:.4f}")
+            print(f"  Poisoned Model Accuracy on Clean Data: {poisoned_on_clean_acc:.4f}")
+            print(f"  Clean Model Accuracy on Clean Data: {clean_acc:.4f}")
+
 
 if __name__ == "__main__":
     experiment = Experiment(num_datasets=1)
