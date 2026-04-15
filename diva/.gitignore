@@ -56,6 +56,7 @@ coverage.xml
 .pytest_cache/
 cover/
 .aim/
+logs/
 
 # Test data
 memento_cache

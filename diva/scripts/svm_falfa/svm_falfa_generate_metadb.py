@@ -95,6 +95,7 @@ class FalfaNNPoisoner(BasePoisoner):
             try:
                 # 1. Generate or load poisoned data
                 if os.path.exists(path_poison_data):
+                    self.logger.info(f'     Already generated poison data loaded. Skip poisoning.')
                     X_train, y_flip, _ = open_csv(path_poison_data)
                 else:
                     time_start = time.time()

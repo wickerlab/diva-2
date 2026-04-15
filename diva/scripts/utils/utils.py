@@ -1,11 +1,13 @@
 import datetime
 import json
+import logging
 import os
 import time
 
 import numpy as np
 import pandas as pd
 
+logger = logging.getLogger(__name__)
 
 def log_cols(path_data):
     """Read data from a CSV file, output the column names"""
@@ -68,6 +70,7 @@ def open_csv(path_data, label_name='y'):
 
 def to_csv(X, y, cols, path_data):
     """Save data into a CSV file."""
+    logger.info(f'Save to: {path_data}')
     df = pd.DataFrame(X, columns=cols, dtype=np.float32)
     labels = len(np.unique(y))
     assert labels == 2, f'Expecting 2 classes, got {labels}'

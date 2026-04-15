@@ -17,6 +17,7 @@ from scripts.svm_featurenoiseinjection.svm_featurenoiseinjection_generate_metadb
 from scripts.svm_randomlabelflip.svm_randomlabelflip_generate_metadb import RandomFlipPoisoner
 from scripts.svm_alfa.svm_alfa_generate_metadb import AlfaPoisoner
 from scripts.svm_falfa.svm_falfa_generate_metadb import FalfaNNPoisoner
+from scripts.svm_art.svm_art_generate_metadb import ArtSvmPoisoner
 import logging
 
 

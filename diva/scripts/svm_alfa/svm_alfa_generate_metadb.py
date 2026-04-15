@@ -9,7 +9,7 @@ from sklearn.svm import SVC
 from scipy.stats import loguniform
 
 from .utils.alfa import alfa
-from .utils.utils import create_dir, open_csv, to_csv, transform_label
+from ..utils.utils import create_dir, open_csv, to_csv, transform_label
 from ..base_poisoner import BasePoisoner
 from sklearn.experimental import enable_halving_search_cv
 from sklearn.model_selection import HalvingRandomSearchCV
@@ -52,6 +52,7 @@ class AlfaPoisoner(BasePoisoner):
             path_poison_data = '{}_alfa_svm_{:.2f}.csv'.format(path_output_base, np.round(rate, 2))
             try:
                 if os.path.exists(path_poison_data):
+                    self.logger.info(f'     Already generated poison data loaded. Skip poisoning.')
                     X_train, y_flip, _ = open_csv(path_poison_data)
                 else:
                     time_start = time.time()

@@ -10,24 +10,24 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, precision_score, recall_score, f1_score
 
 from ..base_poisoner import BasePoisoner
+from ..utils.utils import open_csv
 import argparse
 from pathlib import Path
 import logging
+from tqdm import tqdm
 
 # Constants
 RANDOM_SEED = 100
 PCA_COMPONENTS = 10
 N_NEIGHBORS = 5
-MAX_ITERATIONS = 50
+MAX_ITERATIONS = 25
 EPSILON = 1e-6
 
 class PoisSVMPoisoner(BasePoisoner):
     def __init__(self, base_folder):
-        # Note the custom directory "numerical_gradient"
         super().__init__(name="poissvm_svm", base_folder=base_folder, custom_complexity_dir="numerical_gradient")
 
     def extract_key(self, filename):
-        # Override BasePoisoner's extract_key to match PoisSVM's naming convention
         filename = os.path.basename(filename)
         return "_".join(filename.split("_")[:-1]) 
 
@@ -48,7 +48,7 @@ class PoisSVMPoisoner(BasePoisoner):
         return X_pca, y, labels, n_components
 
     def train_svm(self, X_train, y_train, C=1.0, gamma="scale"):
-        svm = SVC(kernel="rbf", C=C, gamma=gamma, probability=True, class_weight="balanced", random_state=RANDOM_SEED)
+        svm = SVC(kernel="rbf", C=C, gamma=gamma, probability=True, class_weight="balanced", random_state=RANDOM_SEED, cache_size=1000)
         svm.fit(X_train, y_train)
         return svm
 
@@ -72,7 +72,7 @@ class PoisSVMPoisoner(BasePoisoner):
         class_support_indices = [i for i in support_indices if y_train[i] == attacked_class]
         
         initial_index = np.random.choice(class_support_indices) if class_support_indices else np.random.choice(class_indices)
-        return X_train[initial_index].copy(), 1 - y_train[initial_index]
+        return X_train[initial_index].copy(), -y_train[initial_index]
 
     def gradient_ascent_attack(self, X_train, y_train, X_val, y_val, attack_class=1, C=1.0, gamma="scale"):
         xc, yc = self.initialize_attack_point(X_train, y_train, attacked_class=attack_class)
@@ -91,14 +91,18 @@ class PoisSVMPoisoner(BasePoisoner):
             support_indices = svm.support_
             gamma_value = svm._gamma if gamma in ["scale", "auto"] else gamma
 
-            K = np.exp(-gamma_value * np.linalg.norm(support_vectors - xc, axis=1) ** 2).reshape(-1, 1)
-            gradient = np.zeros_like(xc)
-            for i in range(len(support_vectors)):
-                xi = support_vectors[i].reshape(1, -1)
-                yi = y_poisoned[support_indices[i]]
-                alpha_i = dual_coefs[i]
-                diff = xc - xi
-                gradient += alpha_i * yi * K[i] * (2 * gamma_value * diff)
+            diffs = xc - support_vectors  # Broadcast subtraction: shape (N_support, N_features)
+            sq_dists = np.linalg.norm(diffs, axis=1) ** 2
+            K = np.exp(-gamma_value * sq_dists).reshape(-1, 1)
+
+            yi = y_poisoned[support_indices].reshape(-1, 1)
+            alpha_i = dual_coefs.reshape(-1, 1)
+            
+            # Compute coefficients for all support vectors at once
+            coeffs = alpha_i * yi * K * (2 * gamma_value)
+            
+            # Multiply coefficients by differences and sum over axis 0 to get final gradient
+            gradient = np.sum(coeffs * diffs, axis=0).reshape(1, -1)
 
             decision_values = svm.decision_function(X_val)
             hinge_losses = np.maximum(0, 1 - y_val * decision_values)
@@ -109,7 +113,6 @@ class PoisSVMPoisoner(BasePoisoner):
             svm = self.train_svm(X_poisoned, y_poisoned, C=C, gamma=gamma)
 
             if prev_loss is not None and abs(L_xc - prev_loss) < EPSILON:
-                self.logger.info(f"     Converged at iteration {iteration}")
                 break
 
             prev_loss = L_xc
@@ -144,20 +147,35 @@ class PoisSVMPoisoner(BasePoisoner):
             "Train.Poison": acc_train_clean, "Test.Poison": acc_test_clean,
         })
 
-        # Iterate Advx range > 0
+        current_poison_count = 0
+        X_poisoned, y_poisoned = X_train.copy(), y_train.copy()
+        svm_poisoned = svm_clean
+
         for rate in advx_range:
             if rate == 0.0: continue
-            num_attack_points = max(1, int(rate * len(X_train)))
-            X_poisoned, y_poisoned = X_train.copy(), y_train.copy()
+            
+            poison_file_name = f"{base_file_name}_numericalgradient_svm_{rate:.2f}.csv"
+            poison_data_path = os.path.join(self.complexity_dir, poison_file_name)
 
-            for _ in range(num_attack_points):
-                X_poisoned, y_poisoned, svm_poisoned = self.gradient_ascent_attack(X_poisoned, y_poisoned, X_val, y_val)
+            if os.path.exists(poison_data_path):
+                self.logger.info(f'     Already generated poison data loaded. Skip poisoning.')
+                X_poisoned, y_poisoned, _ = open_csv(poison_data_path)
+                svm_poisoned = self.train_svm(X_poisoned, y_poisoned, C=1, gamma="scale")
+
+            else:
+                target_num_attack_points = max(1, int(rate * len(X_train)))
+                points_to_add = target_num_attack_points - current_poison_count
+
+                # Only generate new points if necessary
+                if points_to_add > 0:
+                    pbar = tqdm(range(points_to_add), ncols=100, desc=f"Poisoning to {rate:.2f}")
+                    for _ in pbar:
+                        X_poisoned, y_poisoned, svm_poisoned = self.gradient_ascent_attack(X_poisoned, y_poisoned, X_val, y_val)
+                    current_poison_count = target_num_attack_points
 
             acc_train_poison, _, _, _, _ = self.evaluate(svm_poisoned, X_poisoned, y_poisoned)
             acc_test_poison, _, _, _, _ = self.evaluate(svm_poisoned, X_test, y_test)
 
-            poison_file_name = f"{base_file_name}_numericalgradient_svm_{rate:.2f}.csv"
-            poison_data_path = os.path.join(self.complexity_dir, poison_file_name)
             
             pd.DataFrame(np.hstack([X_poisoned, y_poisoned.reshape(-1, 1)]), 
                             columns=[f"feature_{i}" for i in range(X_poisoned.shape[1])] + ["label"]).to_csv(poison_data_path, index=False)

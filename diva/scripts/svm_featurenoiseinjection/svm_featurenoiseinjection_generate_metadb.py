@@ -7,7 +7,7 @@ from sklearn.model_selection import RandomizedSearchCV, train_test_split
 from sklearn.svm import SVC
 from scipy.stats import loguniform
 
-from .utils.utils import create_dir, open_csv, to_csv
+from ..utils.utils import create_dir, open_csv, to_csv
 from ..base_poisoner import BasePoisoner
 
 import argparse
@@ -47,6 +47,7 @@ class FeatureNoisePoisoner(BasePoisoner):
             path_noisy_data = "{}_featurenoiseinjection_svm_{:.2f}.csv".format(path_output_base, np.round(rate, 2))
             try:
                 if os.path.exists(path_noisy_data):
+                    self.logger.info(f'     Already generated poison data loaded. Skip poisoning.')
                     X_train_noisy, y_train_noisy, _ = open_csv(path_noisy_data)
                 else:
                     X_train_noisy = self.inject_feature_noise(X_train, rate)

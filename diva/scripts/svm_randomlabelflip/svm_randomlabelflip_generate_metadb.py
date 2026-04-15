@@ -7,7 +7,7 @@ from sklearn.model_selection import RandomizedSearchCV, train_test_split
 from sklearn.svm import SVC
 from scipy.stats import loguniform
 
-from .utils.utils import create_dir, open_csv, to_csv
+from ..utils.utils import create_dir, open_csv, to_csv
 from ..base_poisoner import BasePoisoner
 import argparse
 from pathlib import Path
@@ -30,7 +30,7 @@ class RandomFlipPoisoner(BasePoisoner):
         y_flip = y_train.copy()
         n_flip = int(len(y_train) * rate)
         flip_indices = np.random.choice(len(y_train), size=n_flip, replace=False)
-        y_flip[flip_indices] = 1 - y_flip[flip_indices]
+        y_flip[flip_indices] = - y_flip[flip_indices]
         return y_flip
 
     def compute_and_save_flipped_data(self, X_train, y_train, X_test, y_test, clf, path_output_base, cols, flip_rate_range):
@@ -45,6 +45,7 @@ class RandomFlipPoisoner(BasePoisoner):
             path_poison_data = "{}_randomlabelflip_svm_{:.2f}.csv".format(path_output_base, np.round(rate, 2))
             try:
                 if os.path.exists(path_poison_data):
+                    self.logger.info(f'     Already generated poison data loaded. Skip poisoning.')
                     X_train, y_flip, _ = open_csv(path_poison_data)
                 else:
                     y_flip = self.random_label_flip(y_train, rate)
