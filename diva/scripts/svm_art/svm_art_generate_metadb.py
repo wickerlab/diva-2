@@ -15,6 +15,7 @@ from art.attacks.poisoning import PoisoningAttackSVM
 
 from ..utils.utils import open_csv, to_csv
 from ..base_poisoner import BasePoisoner
+from sklearn.utils import resample
 
 warnings.filterwarnings('ignore')
 
@@ -33,11 +34,8 @@ class ArtSvmPoisoner(BasePoisoner):
         x_max = np.max(X_train)
         clip_bounds = (float(x_min), float(x_max))
 
-        val_subset_size = min(len(X_test), 200) # Use max 200 points to evaluate the attack
-        idx_val = np.random.choice(len(X_test), val_subset_size, replace=False)
-        
-        x_val_subset = X_test[idx_val]
-        y_val_subset_art = y_test_art[idx_val]
+        feature_range = x_max - x_min
+        dynamic_step = max(0.1, feature_range * 0.05)
 
         acc_train_clean = clf.score(X_train, y_train)
         acc_test_clean = clf.score(X_test, y_test)
@@ -56,34 +54,34 @@ class ArtSvmPoisoner(BasePoisoner):
             else:
                 time_start = time.time()
                 
-                n_poison = int(len(X_train) * 0.5 *rate)
+                n_poison = int(len(X_train) *rate)
 
-                self.logger.info(f'  Generating {rate * 0.5 * 100:.0f}% poison data (ie {n_poison} points) via ART...')
+                self.logger.info(f'  Generating {rate * 100:.0f}% poison data (ie {n_poison} points) via ART...')
+                self.logger.info(f'   Len of X_test: {len(y_test)} (previous: 250), len of X_train: {len(y_train)} (previous: 1500)')
                 
                 if n_poison == 0:
                     X_poison, y_poison = X_train, y_train
                 else:
-                    surrogate_size = min(len(X_train), 1500) 
-                    idx_surrogate = np.random.choice(len(X_train), surrogate_size, replace=False)
-                    
-                    x_train_surrogate = X_train[idx_surrogate]
-                    y_train_surrogate_art = y_train_art[idx_surrogate]
+                    #! Maybe reduce the X_poison and y_poison to the surrogate
+                    #! Not a huge drop of accuracy because tested on the whole dataset while poisoning was only on 10%
+                    #! of 1/10 of the whole dataset, ie 1% of the whole dataset.
+                    #! -> Must be tested on 1/10 of the dataset
 
                     # Train the lightweight surrogate
-                    clf_surrogate = SVC(kernel='linear')
-                    clf_surrogate.fit(x_train_surrogate, np.argmax(y_train_surrogate_art, axis=1))
+                    clf_surrogate = SVC(kernel='linear', C=10.0)
+                    clf_surrogate.fit(X_train, np.argmax(y_train_art, axis=1))
                     art_classifier_surrogate = SklearnClassifier(model=clf_surrogate, clip_values=clip_bounds)
 
                     # Initialize the attack strictly on the fast surrogate model
                     attack = PoisoningAttackSVM(
                         classifier=art_classifier_surrogate,
-                        step=0.2,
-                        eps=1.0,
-                        x_train=x_train_surrogate,
-                        y_train=y_train_surrogate_art,
-                        x_val=x_val_subset,
-                        y_val=y_val_subset_art,
-                        max_iter=5
+                        step=dynamic_step,
+                        eps=feature_range,
+                        x_train=X_train,
+                        y_train=y_train_art,
+                        x_val=X_test,
+                        y_val=y_test_art,
+                        max_iter=15
                     )
                     
                     # --- Generate Attack Points ---
@@ -127,12 +125,16 @@ class ArtSvmPoisoner(BasePoisoner):
         
         # Sanitize labels to {0, 1}
         y_train = np.where(y_train == -1, 0, y_train)
+
+        if X_train.shape[0] > 1000:
+            self.logger.info(f"Downsampling from {X_train.shape[0]} to {1000}...")
+            X_train, y_train = resample(X_train, y_train, n_samples=1000, stratify=y_train, random_state=42)
         
         X_train, X_test, y_train, y_test = train_test_split(X_train, y_train, test_size=0.2)
         dataname = Path(file_path).stem
 
         # Train the initial clean model required by ART
-        clf = SVC(kernel='linear')
+        clf = SVC(kernel='linear', C=10.0)
         clf.fit(X_train, y_train)
 
         output_base_path = os.path.join(self.complexity_dir, dataname)
