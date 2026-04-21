@@ -141,7 +141,7 @@ class BasePoisoner(ABC):
         merged_data.to_csv(self.meta_db, index=False)
         self.logger.info(f"Merged MetaDB saved to {self.meta_db}")
 
-    def run_pipeline(self, file_paths, advx_range, entrypoint="poison"):
+    def run_pipeline(self, file_paths, advx_range, entrypoint="poison", max_worker=None):
         """
         Executes the full pipeline for this specific poisoner.
         """
@@ -158,7 +158,7 @@ class BasePoisoner(ABC):
         if entrypoint in ("cmeasure", "poison") :
             # 2. Extract Complexity
             self.logger.info(f"\nExtracting complexity measures for {self.name}...")
-            cmeasure_df = self.extract_complexity_measures()
+            cmeasure_df = self.extract_complexity_measures(max_workers=max_worker)
 
         if entrypoint in ("metadb", "cmeasure", "poison") :
             if cmeasure_df is None:

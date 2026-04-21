@@ -25,7 +25,7 @@ EPSILON = 1e-6
 
 class PoisSVMPoisoner(BasePoisoner):
     def __init__(self, base_folder):
-        super().__init__(name="poissvm_svm", base_folder=base_folder, custom_complexity_dir="numerical_gradient")
+        super().__init__(name="poissvm_svm", base_folder=base_folder)
 
     def extract_key(self, filename):
         filename = os.path.basename(filename)
@@ -124,6 +124,7 @@ class PoisSVMPoisoner(BasePoisoner):
 
     def apply_poisoning(self, file, advx_range):
         X, y, _, _ = self.load_and_preprocess_data(file)
+        y_train = np.where(y_train == -1, 0, y_train)
         X_train_full, X_test, y_train_full, y_test = train_test_split(X, y, test_size=0.2, random_state=RANDOM_SEED, stratify=y)
         X_train, X_val, y_train, y_val = train_test_split(X_train_full, y_train_full, test_size=0.2, random_state=RANDOM_SEED, stratify=y_train_full)
         

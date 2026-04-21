@@ -71,6 +71,7 @@ class RandomFlipPoisoner(BasePoisoner):
 
     def apply_poisoning(self, file_path, advx_range):
         X_train, y_train, cols = open_csv(file_path)
+        y_train = np.where(y_train == 0, -1, y_train)
         X_train, X_test, y_train, y_test = train_test_split(X_train, y_train, test_size=0.2)
         dataname = Path(file_path).stem
 

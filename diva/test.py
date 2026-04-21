@@ -63,7 +63,7 @@ def step1_prepare_clean_data(args, paths, logger):
     Step 1: Load dataset, binarize labels, apply TruncatedSVD(100), 
     downsample if necessary, and save to a clean CSV.
     """
-    clean_csv_path = os.path.join(paths['clean_dir'], f"{args.dataset}_svd100_clean.csv")
+    clean_csv_path = os.path.join(paths['clean_dir'], f"{args.dataset}_svd{args.truncated}_n{args.max_sample}_clean.csv")
     
     if os.path.exists(clean_csv_path):
         logger.info(f"Clean CSV already exists at {clean_csv_path}. Skipping generation.")
@@ -148,7 +148,7 @@ def step4_evaluate_diva(args, paths, logger, aim_run):
         X_meta = X_meta_df.fillna(0.0).values
         
         acc_pred = meta_learner.predict(X_meta)[0]
-        is_flagged = abs(acc_emp - acc_pred) > (acc_emp * 0.05)
+        is_flagged = acc_pred - acc_emp > (acc_emp * 0.05)
         
         rates.append(rate)
         results_emp.append(acc_emp)
@@ -193,8 +193,9 @@ if __name__ == "__main__":
     parser.add_argument("--max", type=float, default=0.41, help="Max poisoning rate")
     parser.add_argument("--step", type=float, default=0.05, help="Poisoning rate step size")
     parser.add_argument("--max_sample", type=int, default=50000, help="Downsample threshold")
-    parser.add_argument("--metalearner", type=str, default="metalearner_feature_noise_svm+random_flip_svm+poissvm_svm+alfa_svm.pkl", help="Name of the metalearner model")
+    parser.add_argument("--metalearner", type=str, default="metalearner_random_flip_svm.pkl", help="Name of the metalearner model")
     parser.add_argument("--truncated", type=int, default=100, help="Feature reduction")
+    parser.add_argument("--max_worker", type=int, default=None, help="Max worker used to extract in parallel complexity measure")
     parser.add_argument("--description", type=str, default="", help="Description of the run for Aim")
     args = parser.parse_args()
 
@@ -208,9 +209,6 @@ if __name__ == "__main__":
     }
 
     logger = setup_logger(args.dataset, args.method)
-    
-    run = Run(experiment=f"DIVA_{args.dataset.upper()}")
-    run["hparams"] = vars(args)
 
     try:
         logger.info("--- Step 1: Preparing Clean Data (SVD) ---")
@@ -222,13 +220,16 @@ if __name__ == "__main__":
         PoisonerClass = POISONER_MAP[args.method]
         poisoner = PoisonerClass(base_folder=paths['base_folder'])
         
-        meta_db = poisoner.run_pipeline([clean_file], advx_range, entrypoint="poison")
+        meta_db = poisoner.run_pipeline([clean_file], advx_range, entrypoint="poison", max_worker=args.max_worker)
         paths['meta_db'] = meta_db
+
+        run = Run(experiment=f"DIVA_{args.dataset.upper()}")
+        run.set("description", args.description)
+        run["hparams"] = vars(args)
         
         step4_evaluate_diva(args, paths, logger, aim_run=run)
         
         logger.info("DIVA Evaluation Pipeline completed successfully.")
+        run.close()
     except Exception as e:
         logger.exception("A fatal error occurred during pipeline execution:")
-    finally:
-        run.close()
