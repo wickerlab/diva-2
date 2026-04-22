@@ -70,10 +70,10 @@ class BasePoisoner(ABC):
         """
         poisoned_files = glob.glob(os.path.join(self.complexity_dir, "*.csv"))
         
-        # Remove the output file from the list if it already exists
+        # Skip if it already exists
         output_path = os.path.join(self.complexity_dir, "complexity_measures.csv")
         if output_path in poisoned_files:
-            poisoned_files.remove(output_path)
+            return self.get_complexity_measures()
 
         results = []
         
