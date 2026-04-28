@@ -64,7 +64,7 @@ class FalfaNNPoisoner(BasePoisoner):
         X, y, cols = open_csv(file_path)
         y = np.where(y == -1, 0, y)
         dataname = Path(file_path).stem
-        path_output_base = os.path.join(self.complexity_dir, dataname)
+        path_output_base = os.path.join(self.poisoned_dir, dataname)
 
         n_features = X.shape[1]
         model = SimpleModel(n_features, hidden_dim=HIDDEN_LAYER, output_dim=2).to(self.device)
@@ -90,5 +90,13 @@ class FalfaNNPoisoner(BasePoisoner):
 
             path_poison_data_list.append(path_poison_data)
 
-        data = {'Data': np.tile(dataname, reps=len(advx_range)), 'Path.Poison': path_poison_data_list, 'Rate': advx_range}
-        pd.DataFrame(data).to_csv(self.csv_score, mode='a' if os.path.exists(self.csv_score) else 'w', header=not os.path.exists(self.csv_score), index=False)
+        metadata_list = []
+        for p, r in zip(path_poison_data_list, advx_range):
+            metadata_list.append({
+                "Data": dataname, 
+                "Path": p, 
+                "Method": self.name, 
+                "Rate": r, 
+                "Is_Poisoned": 1 if r > 0 else 0
+            })
+        return metadata_list

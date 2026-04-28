@@ -38,6 +38,9 @@ class PoisSVMPoisoner(BasePoisoner):
         xc, yc = self.initialize_attack_point(X_train, y_train, attacked_class=1)
         xc, yc = xc.reshape(1, -1), np.array([yc])
 
+        # Hinge loss requires labels in {-1, 1}
+        y_val_hinge = np.where(y_val == 0, -1, 1)
+
         prev_loss, step_size = None, 0.1
         X_poisoned, y_poisoned = np.vstack([X_train, xc]), np.hstack([y_train, yc])
         svm = self.train_svm(X_poisoned, y_poisoned)
@@ -48,19 +51,27 @@ class PoisSVMPoisoner(BasePoisoner):
             sq_dists = np.linalg.norm(diffs, axis=1) ** 2
             K = np.exp(-gamma_val * sq_dists).reshape(-1, 1)
 
-            yi = y_poisoned[svm.support_].reshape(-1, 1)
-            alpha_i = svm.dual_coef_[0].reshape(-1, 1)
+            # Map current SVM labels to {-1, 1} to prevent zeroing out Class 0
+            y_poisoned_hinge = np.where(y_poisoned == 0, -1, 1)
+            yi_hinge = y_poisoned_hinge[svm.support_].reshape(-1, 1)
             
-            coeffs = alpha_i * yi * K * (2 * gamma_val)
+            # Scikit-learn's dual_coef_ natively stores (alpha_i * y_i). 
+            # To isolate absolute alpha_i as intended by the original heuristic, we take the absolute value.
+            abs_alpha_i = np.abs(svm.dual_coef_[0].reshape(-1, 1))
+            
+            coeffs = abs_alpha_i * yi_hinge * K * (2 * gamma_val)
             gradient = np.sum(coeffs * diffs, axis=0).reshape(1, -1)
 
-            L_xc = np.sum(np.maximum(0, 1 - y_val * svm.decision_function(X_val)))
+            # Evaluate correct Hinge Loss
+            decision_values = svm.decision_function(X_val)
+            L_xc = np.sum(np.maximum(0, 1 - y_val_hinge * decision_values))
 
             xc_new = xc + step_size * gradient
             X_poisoned[-1] = xc_new.flatten()
             svm = self.train_svm(X_poisoned, y_poisoned)
 
-            if prev_loss is not None and abs(L_xc - prev_loss) < EPSILON: break
+            if prev_loss is not None and abs(L_xc - prev_loss) < EPSILON: 
+                break
             
             prev_loss = L_xc
             xc = xc_new.copy()
@@ -72,7 +83,7 @@ class PoisSVMPoisoner(BasePoisoner):
         X, y, cols = open_csv(file_path)
         y = np.where(y == -1, 0, y)
         dataname = Path(file_path).stem
-        path_output_base = os.path.join(self.complexity_dir, dataname)
+        path_output_base = os.path.join(self.poisoned_dir, dataname)
 
         try:
             X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, stratify=y, random_state=RANDOM_SEED)
@@ -82,12 +93,11 @@ class PoisSVMPoisoner(BasePoisoner):
         path_poison_data_list = []
         current_poison_count = 0
         
-        # Track surrogate state so that at each new rate, we keep the previously generated poisoned point
-        # And just add new ones to reach the current rate -> Huge optimization
+        # Track surrogate state
         X_surr, y_surr = X_train.copy(), y_train.copy()
 
         for rate in advx_range:
-            path_poison_data = f"{path_output_base}_numericalgradient_svm_{rate:.2f}.csv"
+            path_poison_data = f"{path_output_base}_poissvm_svm_{rate:.2f}.csv"
             n_poison = int(len(X) * rate)
 
             if os.path.exists(path_poison_data):
@@ -118,5 +128,14 @@ class PoisSVMPoisoner(BasePoisoner):
 
             path_poison_data_list.append(path_poison_data)
 
-        data = {'Data': np.tile(dataname, reps=len(advx_range)), 'Path.Poison': path_poison_data_list, 'Rate': advx_range}
-        pd.DataFrame(data).to_csv(self.csv_score, mode='a' if os.path.exists(self.csv_score) else 'w', header=not os.path.exists(self.csv_score), index=False)
+        # Meta Database append handling
+        metadata_list = []
+        for p, r in zip(path_poison_data_list, advx_range):
+            metadata_list.append({
+                "Data": dataname, 
+                "Path": p, 
+                "Method": self.name, 
+                "Rate": r, 
+                "Is_Poisoned": 1 if r > 0 else 0
+            })
+        return metadata_list

@@ -22,78 +22,68 @@ class ArtSvmPoisoner(BasePoisoner):
         X, y, cols = open_csv(file_path)
         y = np.where(y == -1, 0, y)
         dataname = Path(file_path).stem
-        path_output_base = os.path.join(self.complexity_dir, dataname)
+        path_output_base = os.path.join(self.poisoned_dir, dataname)
 
         # ART requires a validation set to trace gradients. Standard 80/20 surrogate split.
         try:
-            X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+            X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.5, stratify=y, random_state=42)
         except ValueError:
-            X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+            X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.5, random_state=42)
 
         y_val_art = np.eye(2)[y_val.astype(int)]
         clip_bounds = (float(np.min(X_train)), float(np.max(X_train)))
 
         path_poison_data_list = []
-        current_poison_count = 0
-        
-        # Initialize surrogate state tracking
-        X_surr, y_surr = X_train.copy(), y_train.copy()
 
         for rate in advx_range:
+            if rate==0.0:
+                continue
             path_poison_data = f'{path_output_base}_art_svm_{rate:.2f}.csv'
             n_poison = int(len(X_train) * rate)
             
             if os.path.exists(path_poison_data):
                 self.logger.info(f'     Rate {rate:.2f}: Already generated. Skipping.')
-                # Recover cumulative state if we skipped a previously generated file
-                if n_poison > current_poison_count:
-                    X_saved, y_saved, _ = open_csv(path_poison_data)
-                    # Extract only the dynamically added malicious points
-                    malicious_x = X_saved[len(X_train):]
-                    malicious_y = y_saved[len(y_train):]
-                    X_surr = np.vstack([X_train, malicious_x])
-                    y_surr = np.concatenate([y_train, malicious_y])
-                    current_poison_count = n_poison
             else:
-                points_to_add = n_poison - current_poison_count
+                self.logger.info(f'     Generating {n_poison} new points to reach {rate * 100:.0f}% via ART...')
                 
-                if points_to_add > 0:
-                    self.logger.info(f'     Generating {points_to_add} new points to reach {rate * 100:.0f}% via ART...')
-                    
-                    # Update surrogate model with the cumulative poisoned state
-                    clf_surrogate = SVC(kernel='linear', C=10.0)
-                    clf_surrogate.fit(X_surr, y_surr)
-                    art_surrogate = SklearnClassifier(model=clf_surrogate, clip_values=clip_bounds)
-                    
-                    y_surr_art = np.eye(2)[y_surr.astype(int)]
-                    
-                    attack = PoisoningAttackSVM(
-                        classifier=art_surrogate, step=0.2, eps=1.0,
-                        x_train=X_surr, y_train=y_surr_art, x_val=X_val, y_val=y_val_art, max_iter=5
-                    )
-                    
-                    # Generate starting coordinates using random clean points
-                    idx = np.random.choice(len(X_train), min(points_to_add, len(X_train)), replace=True)
-                    initial_poison_x = np.copy(X_train[idx])
-                    initial_poison_y = 1 - np.copy(y_train[idx])
-                    initial_poison_y_art = np.eye(2)[initial_poison_y.astype(int)]
-                    
-                    # Execute the attack for the delta
-                    new_malicious_x, new_malicious_y_art = attack.poison(initial_poison_x, initial_poison_y_art)
-                    new_malicious_y = np.argmax(new_malicious_y_art, axis=1)
-                    
-                    # Inject into surrogate state
-                    X_surr = np.vstack([X_surr, new_malicious_x])
-                    y_surr = np.concatenate([y_surr, new_malicious_y])
-                    current_poison_count = n_poison
+                # Update surrogate model with the cumulative poisoned state
+                clf_surrogate = SVC(kernel='linear', C=10.0)
+                clf_surrogate.fit(X_train, y_train)
+                art_surrogate = SklearnClassifier(model=clf_surrogate, clip_values=clip_bounds)
+                
+                y_train_art = np.eye(2)[y_train.astype(int)]
+                
+                attack = PoisoningAttackSVM(
+                    classifier=art_surrogate, step=0.2, eps=1.0,
+                    x_train=X_train, y_train=y_train_art, x_val=X_val, y_val=y_val_art, max_iter=5
+                )
+                
+                # Generate starting coordinates using random clean points
+                idx = np.random.choice(len(X_train), min(n_poison, len(X_train)), replace=True)
+                initial_poison_x = np.copy(X_train[idx])
+                initial_poison_y = 1 - np.copy(y_train[idx])
+                initial_poison_y_art = np.eye(2)[initial_poison_y.astype(int)]
+                
+                # Execute the attack for the delta
+                new_malicious_x, new_malicious_y_art = attack.poison(initial_poison_x, initial_poison_y_art)
+                new_malicious_y = np.argmax(new_malicious_y_art, axis=1)
+                
+                # Inject into surrogate state
+                X_final = np.vstack([X_train, new_malicious_x])
+                y_final = np.concatenate([y_train, new_malicious_y])
                 
                 # Save the current state
-                if n_poison == 0:
-                    to_csv(X_train, y_train, cols, path_poison_data)
-                else:
-                    to_csv(X_surr, y_surr, cols, path_poison_data)
+                to_csv(X_final, y_final, cols, path_poison_data)
 
             path_poison_data_list.append(path_poison_data)
 
-        data = {'Data': np.tile(dataname, reps=len(advx_range)), 'Path.Poison': path_poison_data_list, 'Rate': advx_range}
-        pd.DataFrame(data).to_csv(self.csv_score, mode='a' if os.path.exists(self.csv_score) else 'w', header=not os.path.exists(self.csv_score), index=False)
+        metadata_list = []
+        for p, r in zip(path_poison_data_list, advx_range):
+            metadata_list.append({
+                "Data": dataname, 
+                "Path": p, 
+                "Method": self.name, 
+                "Rate": r, 
+                "Is_Poisoned": 1 if r > 0 else 0
+            })
+        return metadata_list
