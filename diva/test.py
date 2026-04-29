@@ -25,6 +25,7 @@ from scripts.svm_randomlabelflip.svm_randomlabelflip_generate_metadb import Rand
 from scripts.svm_alfa.svm_alfa_generate_metadb import AlfaPoisoner
 from scripts.svm_art.svm_art_generate_metadb import ArtSvmPoisoner
 from scripts.svm_biggio.svm_biggio_generate_metadb import BiggioSvmPoisoner
+from scripts.svm_feature_collision.svm_featurecollision import FeatureCollisionPoisoner
 
 POISONER_MAP = {
     "alfa": AlfaPoisoner,
@@ -32,7 +33,8 @@ POISONER_MAP = {
     "random_flip": RandomFlipPoisoner,
     "poissvm": PoisSVMPoisoner,
     "biggio": BiggioSvmPoisoner,
-    "art": ArtSvmPoisoner
+    "art": ArtSvmPoisoner,
+    "feature_collision": FeatureCollisionPoisoner,
 }
 
 # --- Dataset Enumeration ---
@@ -158,7 +160,7 @@ def step1_prepare_clean_data(args, paths, logger):
     max_svd_components = X_raw.shape[1] - 1
     actual_truncated = min(args.truncated, max_svd_components)
     
-    if actual_truncated > 0 and not sp.issparse(X_raw) and X_raw.shape[1] > actual_truncated + 1:
+    if actual_truncated > 0 and X_raw.shape[1] > actual_truncated + 1:
         logger.info(f"Applying TruncatedSVD (n_components={actual_truncated})...")
         svd = TruncatedSVD(n_components=actual_truncated, random_state=42)
         X_dense = svd.fit_transform(X_raw)
@@ -166,7 +168,10 @@ def step1_prepare_clean_data(args, paths, logger):
             os.makedirs(os.path.dirname(paths['svd_model_path']), exist_ok=True)
             joblib.dump(svd, paths['svd_model_path'])
     else:
-        X_dense = X_raw
+        if sp.issparse(X_raw):
+            X_dense = X_raw.toarray()
+        else:
+            X_dense = X_raw
 
     if X_dense.shape[0] > args.max_sample:
         X_dense, y_raw = resample(X_dense, y_raw, n_samples=args.max_sample, stratify=y_raw, random_state=42)

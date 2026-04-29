@@ -5,30 +5,37 @@ import concurrent.futures
 from tqdm import tqdm
 import logging
 import os
+import warnings
 
 logger = logging.getLogger("CMeasures")
 
 def _extract_single(args):
     file_path, features = args
     try:
-        data = pd.read_csv(file_path)
-        X, y = data.iloc[:, :-1].values, data.iloc[:, -1].values
-        y = np.where(y == -1, 0, y)
-        
-        if features is None:
-            mfe = MFE(groups=["complexity"])
-        else:
-            mfe = MFE(features=features)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = pd.read_csv(file_path)
+            X, y = data.iloc[:, :-1].values, data.iloc[:, -1].values
+            if len(X)>=6000:
+                return None
+            if len(X[0])>=6000:
+                return None
+            y = np.where(y == -1, 0, y)
             
-        mfe.fit(X, y)
-        f, v = mfe.extract()
-        
+            if features is None:
+                mfe = MFE(groups=["complexity"], random_state=42)
+            else:
+                mfe = MFE(features=features, random_state=42)
+                
+            mfe.fit(X, y)
+            f, v = mfe.extract()
+            
         res = {"Path": file_path}
         res.update(dict(zip(f, v)))
         return res
     except Exception as e:
         logger.error(f"Error extracting from {file_path}: {e}")
-        return {"Path": file_path, "error": str(e)}
+        return None
 
 def compute_cmeasures(file_paths, features=None, workers=None, db_path=None):
     """
@@ -61,7 +68,14 @@ def compute_cmeasures(file_paths, features=None, workers=None, db_path=None):
     
     with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(_extract_single, arg): arg for arg in extraction_args}
-        for future in tqdm(concurrent.futures.as_completed(futures), total=len(extraction_args), desc="C-Measures"):
-            results.append(future.result())
-            
+        pbar = tqdm(concurrent.futures.as_completed(futures), total=len(extraction_args), desc="C-Measures")
+        for future in pbar:
+            original_args = futures[future]
+            file_path = original_args[0]
+            filename = os.path.basename(file_path)
+            pbar.set_postfix(file=filename)
+
+            result = future.result()
+            if result is not None:
+                results.append(result)
     return pd.DataFrame(results)

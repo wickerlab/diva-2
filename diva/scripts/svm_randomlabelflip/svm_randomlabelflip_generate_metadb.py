@@ -17,8 +17,6 @@ class RandomFlipPoisoner(BasePoisoner):
 
     def apply_poisoning(self, file_path, advx_range):
         X, y, cols = open_csv(file_path)
-        # Ensure binary {0, 1}
-        y = np.where(y == -1, 0, y) 
         
         dataname = Path(file_path).stem
         path_output_base = os.path.join(self.poisoned_dir, dataname)
@@ -32,6 +30,11 @@ class RandomFlipPoisoner(BasePoisoner):
                 self.logger.info(f'     Rate {rate:.2f}: Already generated. Skipping.')
             else:
                 self.logger.info(f'     Generating {rate * 100:.0f}% poison data via Random Flip...')
+                if rate == 0:
+                    to_csv(X, y, cols, path_poison_data)
+                    continue
+                # Ensure binary {0, 1}
+                y = np.where(y == -1, 0, y) 
                 y_flip = y.copy()
                 n_flip = int(len(y) * rate)
                 
