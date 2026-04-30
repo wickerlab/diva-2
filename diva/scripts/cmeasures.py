@@ -16,9 +16,9 @@ def _extract_single(args):
             warnings.simplefilter("ignore")
             data = pd.read_csv(file_path)
             X, y = data.iloc[:, :-1].values, data.iloc[:, -1].values
-            if len(X)>=6000:
+            if len(X)>=20000:
                 return None
-            if len(X[0])>=6000:
+            if len(X[0])>=10000:
                 return None
             y = np.where(y == -1, 0, y)
             

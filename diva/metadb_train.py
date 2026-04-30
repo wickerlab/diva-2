@@ -7,13 +7,12 @@ import logging
 import joblib
 import glob
 from pathlib import Path
-from tqdm import tqdm
 import openml
 import aim
-from aim.sdk.reporter import RunStatusReporter
 import matplotlib.pyplot as plt
 import seaborn as sns
 import time
+import hashlib
 
 from sklearn.datasets import make_classification
 from sklearn.preprocessing import StandardScaler
@@ -22,10 +21,14 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, confusion_matrix
 from xgboost import XGBClassifier
+import scipy.sparse as sp
+from sklearn.decomposition import TruncatedSVD
+from sklearn.utils import resample
 
 # --- Modular Pipeline Imports ---
 from scripts.cmeasures import compute_cmeasures
-from scripts.meta_db import append_to_db, sync_filesystem_to_metadb
+from scripts.meta_db import append_to_db
+from scripts.utils.plots import *
 
 # --- Import your Specific Poisoners ---
 from scripts.svm_poissvm.svm_poissvm_generate_metadb import PoisSVMPoisoner
@@ -35,6 +38,9 @@ from scripts.svm_alfa.svm_alfa_generate_metadb import AlfaPoisoner
 from scripts.svm_art.svm_art_generate_metadb import ArtSvmPoisoner
 from scripts.svm_biggio.svm_biggio_generate_metadb import BiggioSvmPoisoner
 from scripts.svm_feature_collision.svm_featurecollision import FeatureCollisionPoisoner
+from scripts.witches_brew.witches_brew_generate_metadb import WitchesBrewPoisoner
+from scripts.data_generator.image_fetcher import fetch_and_binarize_images
+from scripts.data_generator.openml_fetcher import fetch_openml_datasets
 
 # Setup Logging
 logging.basicConfig(
@@ -43,10 +49,6 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger("DIVA_Training_Orchestrator")
-if not logger.handlers:
-    ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter('%(asctime)s [%(name)s] [%(levelname)s] %(message)s'))
-    logger.addHandler(ch)
 
 POISONER_MAP = {
     "alfa_svm": AlfaPoisoner,
@@ -55,26 +57,9 @@ POISONER_MAP = {
     #"poissvm_svm": PoisSVMPoisoner,
     "biggio_svm": BiggioSvmPoisoner,
     #"art_svm": ArtSvmPoisoner,
-    "feature_collision": FeatureCollisionPoisoner
+    "feature_collision": FeatureCollisionPoisoner,
+    "witches_brew": WitchesBrewPoisoner
 }
-
-def plot_feature_importances(importances, feature_names, model_name, save_path):
-    """Generates and saves a bar plot of the top 20 C-Measure feature importances."""
-    sns.set_theme(style="whitegrid", context="paper")
-    plt.figure(figsize=(10, 8))
-    
-    indices = np.argsort(importances)[::-1][:20]
-    top_features = [feature_names[i] for i in indices]
-    top_importances = importances[indices]
-    
-    sns.barplot(x=top_importances, y=top_features, palette="viridis")
-    plt.title(f"Top 20 C-Measure Importances ({model_name})", fontsize=14, fontweight='bold', pad=15)
-    plt.xlabel("Importance Score", fontsize=12, fontweight='bold')
-    plt.ylabel("C-Measure", fontsize=12, fontweight='bold')
-    plt.tight_layout()
-    
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
 
 def generate_synthetic_data(n_sets, folder):
     """Generates a diverse set of clean synthetic base datasets."""
@@ -115,113 +100,25 @@ def generate_synthetic_data(n_sets, folder):
 
     return generated_files
 
-
-
-def fetch_openml_datasets(n_max, folder, max_retries=3, db_path=None):
-    """Fetches real-world binary classification datasets from OpenML, skipping existing ones."""
-    logger.info(f"Fetching up to {n_max} OpenML binary datasets...")
-    data_path = os.path.join(folder, "clean_data")
-    os.makedirs(data_path, exist_ok=True)
-    
-    # --- ADDED: Read metadatabase to completely ignore already processed files ---
-    processed_paths = set()
-    if db_path and os.path.exists(db_path):
-        try:
-            processed_paths = set(pd.read_csv(db_path, usecols=['Path'])['Path'].values)
-        except Exception:
-            pass
-    # ---------------------------------------------------------------------------
-    
-    # --- ADDED: Retry mechanism for the OpenML API ---
-    datasets_df = None
-    for attempt in range(max_retries):
-        try:
-            datasets_df = openml.datasets.list_datasets(output_format='dataframe')
-            break # Success, break out of retry loop
-        except Exception as e:
-            wait_time = 5 * (attempt + 1)
-            logger.warning(f"OpenML server error on attempt {attempt + 1}/{max_retries}. Retrying in {wait_time}s... ({e})")
-            time.sleep(wait_time)
-            
-    if datasets_df is None:
-        logger.error("Failed to connect to OpenML after multiple attempts. Aborting OpenML fetch.")
-        return []
-    # --------------------------------------------------
-
-    binary_datasets = datasets_df[
-        (datasets_df['NumberOfClasses'] == 2) & 
-        (datasets_df['NumberOfInstances'] >= 500) &
-        (datasets_df['NumberOfInstances'] <= 2000) & 
-        (datasets_df['NumberOfMissingValues'] == 0) &
-        (datasets_df['NumberOfNumericFeatures'] > 5) &
-        (datasets_df['NumberOfNumericFeatures'] < 6000)
-    ]
-    
-    generated_files = []
-    count = 0
-    
-    for row in binary_datasets.itertuples():
-        if count >= n_max: 
-            break
-            
-        did = row.did
-        dataset_name = row.name
-        safe_name = str(dataset_name).lower().replace(' ', '_').replace('/', '')
-        
-        existing_files = glob.glob(os.path.join(data_path, f"openml_{safe_name}_*.csv"))
-        if existing_files:
-            local_file = existing_files[0]
-            
-            # 1. If it is already fully processed in the metadatabase, ignore it entirely
-            if local_file in processed_paths:
-                continue 
-                
-            # 2. If it is downloaded locally but NOT in the metadatabase, reuse it!
-            generated_files.append(local_file)
-            count += 1
-            logger.info(f"Dataset '{dataset_name}' already exists locally. Skipping download. ({count}/{n_max})")
-            continue
-            
-        # --- ADDED: Inner retry mechanism for individual downloads ---
-        for attempt in range(max_retries):
-            try:
-                dataset = openml.datasets.get_dataset(did)
-                X, y, _, _ = dataset.get_data(target=dataset.default_target_attribute)
-                X_num = X.select_dtypes(include=['number']).dropna(axis=1)
-                
-                if X_num.shape[1] < 5: 
-                    break # Not enough features, move to next dataset
-                
-                X_scaled = StandardScaler().fit_transform(X_num)
-                y_binary = pd.factorize(y)[0]
-                
-                df = pd.DataFrame(X_scaled, columns=[f"feature_{i}" for i in range(X_scaled.shape[1])], dtype=np.float32)
-                df["y"] = y_binary
-                
-                file_name = f"openml_{safe_name}_n{len(y_binary)}_f{X_scaled.shape[1]}.csv"
-                output_path = os.path.join(data_path, file_name)
-                
-                df.to_csv(output_path, index=False)
-                generated_files.append(output_path)
-                count += 1
-                logger.info(f"Successfully loaded OpenML dataset '{dataset.name}' ({count}/{n_max})")
-                break # Success, break out of retry loop
-                
-            except Exception as e:
-                if "107" in str(e) or "server load" in str(e).lower():
-                    logger.warning(f"OpenML server busy while downloading '{dataset_name}'. Retrying...")
-                    time.sleep(3)
-                else:
-                    break # Not a server timeout error, just a weird dataset. Move on.
-            
-    return generated_files
-
 def augment_training_db(db_path, base_folder, n_datasets, n_attacks, workers, source, methods):
     """Orchestrates creating new data and adding it to the Universal Training DB"""
+    # 1. Fetch/Generate Data and Enforce Modality Boundaries
     if source == "synthetic":
         new_clean_files = generate_synthetic_data(n_datasets, base_folder)
+        # Prevent image attacks on tabular data
+        if methods and "witches_brew" in methods:
+            methods.remove("witches_brew")
+            
     elif source == "openml":
         new_clean_files = fetch_openml_datasets(n_datasets, base_folder, db_path=db_path)
+        # Prevent image attacks on tabular data
+        if methods and "witches_brew" in methods:
+            methods.remove("witches_brew")
+            
+    elif source == "cifar":
+        new_clean_files = fetch_and_binarize_images(n_max=n_datasets, base_folder=base_folder, db_path=db_path)
+        methods = ["witches_brew"]
+        logger.info("Modality boundary enforced: Pipeline restricted exclusively to 'witches_brew' for CIFAR-10 .pt files.")
 
     advx_range = np.round(np.arange(0.1, 0.41, 0.05), 2)
     
@@ -264,55 +161,6 @@ def augment_training_db(db_path, base_folder, n_datasets, n_attacks, workers, so
     cmeasures_df = compute_cmeasures(paths_to_compute, workers=workers, db_path=db_path)
     append_to_db(db_path, all_generated_metadata, cmeasures_df)
 
-def plot_confusion_matrix(y_true, y_pred, model_name, save_path):
-    cm = confusion_matrix(y_true, y_pred)
-    plt.figure(figsize=(6, 5))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Clean', 'Poisoned'], yticklabels=['Clean', 'Poisoned'])
-    plt.title(f"Confusion Matrix ({model_name})", fontweight='bold')
-    plt.xlabel("Predicted Label")
-    plt.ylabel("Actual Label")
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-
-def plot_method_accuracy(y_true, y_pred, methods, model_name, save_path):
-    results = []
-    for method in np.unique(methods):
-        mask = (methods == method)
-        acc = accuracy_score(y_true[mask], y_pred[mask])
-        results.append({'Method': method.upper(), 'Accuracy': acc})
-    
-    df_res = pd.DataFrame(results).sort_values(by='Accuracy', ascending=False)
-    plt.figure(figsize=(10, 6))
-    sns.barplot(data=df_res, x='Accuracy', y='Method', palette='viridis')
-    plt.title(f"Detection Accuracy by Attack Method ({model_name})", fontweight='bold')
-    plt.xlim(0, 1.05)
-    for index, value in enumerate(df_res['Accuracy']):
-        plt.text(value + 0.01, index, f"{value:.1%}", va='center')
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-
-def plot_accuracy_heatmap(y_true, y_pred, methods, rates, model_name, save_path):
-    df_eval = pd.DataFrame({'Method': methods, 'Rate': rates, 'Correct': (y_true == y_pred).astype(int)})
-    
-    # Clean up names for the plot
-    df_eval['Method'] = df_eval['Method'].str.upper()
-    df_eval['Rate'] = df_eval['Rate'].apply(lambda x: f"{x:.2f}")
-    
-    # Pivot to create the 2D grid
-    pivot = df_eval.pivot_table(index='Method', columns='Rate', values='Correct', aggfunc='mean')
-    
-    plt.figure(figsize=(12, 6))
-    sns.heatmap(pivot, annot=True, fmt=".1%", cmap="YlGnBu", cbar_kws={'label': 'Accuracy'}, vmin=0, vmax=1)
-    plt.title(f"Accuracy Heatmap: Method vs. Rate ({model_name})", fontweight='bold')
-    plt.ylabel("Poisoning Method")
-    plt.xlabel("Poisoning Rate")
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-
-
 def retrain_metalearner(db_path, model_save_path, aim_run, methods_filter=None):
     logger.info(f"--- Retraining Meta-Learner on Augmented DB: {db_path} ---")
     df = pd.read_csv(db_path)
@@ -340,6 +188,7 @@ def retrain_metalearner(db_path, model_save_path, aim_run, methods_filter=None):
     # Capture Metadata for granular testing before dropping
     methods = df['Method']
     rates = df['Rate']
+    datasets = df['Data']
     
     gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
     train_idx, test_idx = next(gss.split(X, y, groups))
@@ -351,6 +200,7 @@ def retrain_metalearner(db_path, model_save_path, aim_run, methods_filter=None):
     y_test_vals = y_test.values
     methods_test = methods.iloc[test_idx].values
     rates_test = rates.iloc[test_idx].values
+    datasets_test = datasets.iloc[test_idx].values
     
     logger.info(f"Training on {len(X_train)} samples, testing on {len(X_test)} samples.")
     
@@ -388,6 +238,10 @@ def retrain_metalearner(db_path, model_save_path, aim_run, methods_filter=None):
     rf_plot_path = os.path.join(plots_dir, "rf_importances.png")
     plot_feature_importances(clf_rf.feature_importances_, feature_cols, "Random Forest", rf_plot_path)
     aim_run.track(aim.Image(rf_plot_path), name='Feature_Importances', context={"model": "RandomForest"})
+
+    rf_curves_path = os.path.join(plots_dir, "rf_confidence_curves.png")
+    plot_all_confidence_curves(datasets_test, methods_test, rates_test, y_prob_rf, "Random Forest", rf_curves_path)
+    aim_run.track(aim.Image(rf_curves_path), name='Confidence_Curves', context={"model": "RandomForest"})
     
     joblib.dump(clf_rf, model_save_path)
 
@@ -426,6 +280,10 @@ def retrain_metalearner(db_path, model_save_path, aim_run, methods_filter=None):
     xgb_plot_path = os.path.join(plots_dir, "xgb_importances.png")
     plot_feature_importances(clf_xgb.feature_importances_, feature_cols, "XGBoost", xgb_plot_path)
     aim_run.track(aim.Image(xgb_plot_path), name='Feature_Importances', context={"model": "XGBoost"})
+
+    xgb_curves_path = os.path.join(plots_dir, "xgb_confidence_curves.png")
+    plot_all_confidence_curves(datasets_test, methods_test, rates_test, y_prob_xgb, "XGBoost", xgb_curves_path)
+    aim_run.track(aim.Image(xgb_curves_path), name='Confidence_Curves', context={"model": "XGBoost"})
     
     # Log numerical accuracy explicitly for each method to Aim Metrics
     for method in np.unique(methods_test):
@@ -449,7 +307,7 @@ if __name__ == "__main__":
     parser.add_argument("--db_path", type=str, default="data/universal_meta_database.csv", help="Path to master DB")
     parser.add_argument("--model_path", type=str, default="data/universal_meta_classifier.joblib", help="Path to save models")
     parser.add_argument("--add_datasets", type=int, default=0, help="Number of new datasets to process")
-    parser.add_argument("--source", type=str, default="synthetic", choices=["synthetic", "openml"], help="Dataset source")
+    parser.add_argument("--source", type=str, default="synthetic", choices=["synthetic", "openml", "cifar"], help="Dataset source")
     parser.add_argument("--base_folder", type=str, default="data", help="Data storage folder")
     parser.add_argument("--workers", type=int, default=None, help="Number of CPU cores for PyMFE")
     parser.add_argument("--retrain_only", action="store_true", help="Skip dataset generation and just retrain")

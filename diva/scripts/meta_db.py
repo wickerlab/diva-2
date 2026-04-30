@@ -171,9 +171,13 @@ def print_db_statistics(db_path):
     if 'Is_Poisoned' in df.columns:
         print("\n--- ⚖️ Class Distribution ---")
         clean_count = len(df[df['Is_Poisoned'] == 0])
+        openml_count = len(df[(df['Is_Poisoned'] == 0) & (df['Data'].str.contains("openml", na=False))])
+        cifar_count = len(df[(df['Is_Poisoned'] == 0) & (df['Data'].str.contains("CIFAR", na=False))])
         pois_count = len(df[df['Is_Poisoned'] == 1])
         print(f"Clean (0):    {clean_count} ({clean_count/len(df):.1%})")
         print(f"Poisoned (1): {pois_count} ({pois_count/len(df):.1%})")
+        print(f"Clean OpenML Dataset: {openml_count} ({openml_count/clean_count:.1%})")
+        print(f"Clean CIFAR Dataset: {cifar_count} ({cifar_count/clean_count:.1%})")
 
     if 'Method' in df.columns:
         print("\n--- 🛡️ Breakdown by Method ---")

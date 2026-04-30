@@ -26,6 +26,7 @@ from scripts.svm_alfa.svm_alfa_generate_metadb import AlfaPoisoner
 from scripts.svm_art.svm_art_generate_metadb import ArtSvmPoisoner
 from scripts.svm_biggio.svm_biggio_generate_metadb import BiggioSvmPoisoner
 from scripts.svm_feature_collision.svm_featurecollision import FeatureCollisionPoisoner
+from scripts.witches_brew.witches_brew_generate_metadb import WitchesBrewPoisoner
 
 POISONER_MAP = {
     "alfa": AlfaPoisoner,
@@ -35,6 +36,7 @@ POISONER_MAP = {
     "biggio": BiggioSvmPoisoner,
     "art": ArtSvmPoisoner,
     "feature_collision": FeatureCollisionPoisoner,
+    "witches_brew": WitchesBrewPoisoner,
 }
 
 # --- Dataset Enumeration ---
@@ -46,30 +48,60 @@ class DatasetEnum(str, Enum):
     BREAST_CANCER = "breast_cancer"
     SPAMBASE = "spambase"
     DIABETES = "diabetes"
+    SVHN = "svhn"
 
-def generate_diva_plot(args, rates, ground_truths, predictions, probabilities, logger, aim_run, plot_path):
-    logger.info("Generating Binary DIVA Detection Plot...")
-    fig = plt.figure(figsize=(10, 6))
+def plot_multimethod_confidence(dataset_name, methods, rates, ground_truths, predictions, probabilities, logger, aim_run, plot_path):
+    logger.info("Generating Multi-Method DIVA Detection Plot...")
     
-    # Plot continuous probability curve
-    plt.plot(rates, probabilities, 'b-', label='Detection Confidence', linewidth=2, alpha=0.7)
+    df = pd.DataFrame({
+        'Method': methods,
+        'Rate': rates,
+        'GT': ground_truths,
+        'Pred': predictions,
+        'Prob': probabilities
+    })
     
-    # Scatter points indicating correct/incorrect predictions
-    for r, gt, pred, prob in zip(rates, ground_truths, predictions, probabilities):
-        is_correct = (gt == bool(pred))
-        color = 'green' if is_correct else 'red'
-        marker = 'o' if gt else 'X' # Circle for actual poisoned, X for actual clean
+    # Identify the methods tested (ignore any global 'clean' placeholders if they exist)
+    attack_methods = sorted([m for m in df['Method'].unique() if m != 'clean'])
+    
+    if not attack_methods:
+        return
         
-        plt.scatter(r, prob, color=color, s=100, marker=marker, zorder=5, edgecolors='black')
+    # Calculate optimal grid layout
+    cols = int(np.ceil(np.sqrt(len(attack_methods))))
+    rows = int(np.ceil(len(attack_methods) / cols))
+    
+    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 5 * rows), squeeze=False)
+    axes = axes.flatten()
+    
+    for idx, method in enumerate(attack_methods):
+        ax = axes[idx]
+        df_method = df[df['Method'] == method].copy()
+        df_method.sort_values(by='Rate', inplace=True)
+        
+        # Plot continuous probability curve
+        ax.plot(df_method['Rate'], df_method['Prob'], 'b-', linewidth=2, alpha=0.7)
+        
+        # Scatter points indicating correct/incorrect predictions
+        for _, row in df_method.iterrows():
+            is_correct = (row['GT'] == bool(row['Pred']))
+            color = 'green' if is_correct else 'red'
+            marker = 'o' if row['GT'] else 'X' # Circle for actual poisoned, X for actual clean
             
-    plt.title(f"DIVA Meta-Classifier Confidence ({args.method.upper()})")
-    plt.xlabel("Poisoning Rate")
-    plt.ylabel("Probability of Dataset being Poisoned")
-    
-    # Add 50% decision threshold
-    plt.axhline(0.5, color='gray', linestyle='--', linewidth=1.5, label='Decision Threshold (50%)')
-    
-    # Custom Legend
+            ax.scatter(row['Rate'], row['Prob'], color=color, s=100, marker=marker, zorder=5, edgecolors='black')
+        
+        ax.set_title(f"{method.upper()}", fontweight='bold')
+        ax.set_xlabel("Poisoning Rate")
+        ax.set_ylabel("Confidence")
+        ax.axhline(0.5, color='gray', linestyle='--', linewidth=1.5)
+        ax.set_ylim(-0.05, 1.05)
+        ax.grid(True, linestyle='--', alpha=0.6)
+        
+    # Remove empty subplots if grid isn't perfectly filled
+    for i in range(len(attack_methods), len(axes)):
+        fig.delaxes(axes[i])
+        
+    # Build a unified legend at the bottom of the figure
     custom_lines = [
         Line2D([0], [0], color='b', lw=2, alpha=0.7),
         Line2D([0], [0], color='gray', linestyle='--'),
@@ -77,17 +109,16 @@ def generate_diva_plot(args, rates, ground_truths, predictions, probabilities, l
         Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markeredgecolor='black', markersize=10),
         Line2D([0], [0], marker='X', color='w', markerfacecolor='green', markeredgecolor='black', markersize=10)
     ]
-    plt.legend(custom_lines, ['Confidence Curve', 'Decision Threshold', 'Correct (Was Poisoned)', 'Incorrect', 'Correct (Was Clean Baseline)'], loc='lower right')
+    fig.legend(custom_lines, ['Confidence Curve', 'Threshold (50%)', 'Correct (Poisoned)', 'Incorrect', 'Correct (Clean Baseline)'], 
+               loc='lower center', ncol=3, bbox_to_anchor=(0.5, -0.05))
     
-    plt.grid(True, linestyle='--', alpha=0.6)
-    plt.ylim(-0.05, 1.05)
-
-    # Save to disk
+    plt.suptitle(f"DIVA Meta-Classifier Confidence: {dataset_name.upper()}", fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-
-    # Track in Aim using the saved file
-    aim_image = aim.Image(plot_path, caption=f"DIVA Detection: {args.dataset} via {args.method}")
-    aim_run.track(aim_image, name='diva_detection_confidence_plot', context={'dataset': args.dataset})
+    
+    aim_image = aim.Image(plot_path, caption=f"DIVA Multi-Method Detection: {dataset_name}")
+    aim_run.track(aim_image, name='diva_detection_confidence_plot', context={'dataset': dataset_name})
     plt.close(fig)
 
 def step1_prepare_clean_data(args, paths, logger):
@@ -153,6 +184,61 @@ def step1_prepare_clean_data(args, paths, logger):
         data = fetch_openml(name='diabetes', version=1, parser='auto')
         X_raw = StandardScaler().fit_transform(data.data.to_numpy())
         y_raw = np.where(data.target == 'tested_positive', 1, 0)
+    elif dataset_enum == DatasetEnum.SVHN:
+        import torch
+        import torchvision
+        import torchvision.transforms as transforms
+        import torchvision.models as models
+        
+        os.makedirs(paths['raw_dir'], exist_ok=True)
+        # Keep the filename format consistent so the WitchesBrew string-replacement works
+        raw_pt_path = os.path.join(paths['raw_dir'], f"{args.dataset}_svd{args.truncated}_n{args.max_sample}.pt")
+        
+        if not os.path.exists(raw_pt_path):
+            logger.info("Downloading SVHN Dataset...")
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.4377, 0.4438, 0.4728), (0.1980, 0.2010, 0.1970))
+            ])
+            svhn_train = torchvision.datasets.SVHN(root="data", split='train', download=True, transform=transform)
+            
+            # Extract images and labels
+            loader = torch.utils.data.DataLoader(svhn_train, batch_size=len(svhn_train), shuffle=False)
+            X_all, y_all = next(iter(loader))
+            
+            # Create a Binary Subset (Digit 1 vs Digit 7)
+            mask = (y_all == 1) | (y_all == 7)
+            X_pair, y_pair = X_all[mask], y_all[mask]
+            y_pair = torch.where(y_pair == 1, torch.tensor(0), torch.tensor(1))
+            
+            # Subsample
+            indices = torch.randperm(len(y_pair))[:args.max_sample]
+            torch.save({"X": X_pair[indices], "y": y_pair[indices]}, raw_pt_path)
+            
+        logger.info("Extracting Latent features for clean SVHN...")
+        data = torch.load(raw_pt_path)
+        X_images, y_labels = data["X"], data["y"]
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT).to(device)
+        latent_extractor = torch.nn.Sequential(*(list(resnet.children())[:-1])).eval()
+        
+        latent_vectors = []
+        with torch.no_grad():
+            for i in range(0, len(X_images), 128):
+                batch = X_images[i:i+128].to(device)
+                latent_vectors.append(latent_extractor(batch).squeeze().cpu())
+                
+        X_dense = torch.cat(latent_vectors).numpy()
+        y_raw = y_labels.numpy()
+        
+        # We skip SVD for image embeddings to preserve the 512D Latent topological structure
+        col_names = [f"feature_{i}" for i in range(X_dense.shape[1])]
+        df = pd.DataFrame(X_dense, columns=col_names)
+        df['y'] = y_raw
+        df.to_csv(clean_csv_path, index=False)
+        
+        return clean_csv_path
     else:
         raise ValueError(f"Dataset {args.dataset} logic missing.")
 
@@ -186,8 +272,10 @@ def step1_prepare_clean_data(args, paths, logger):
 def orchestrate_test(args):
     """Main Orchestrator tying together Data Prep, Poisoning, C-Measures, DB appending, and Aim Eval."""
     
-    # 0. Setup Logging & Aim Tracking
-    logger = logging.getLogger(f"DIVA_{args.method.upper()}")
+    # Determine methods to run (default to all if none provided)
+    methods_to_run = args.methods if args.methods else list(POISONER_MAP.keys())
+    
+    logger = logging.getLogger(f"DIVA_TEST_{args.dataset.upper()}")
     logger.setLevel(logging.INFO)
     if not logger.handlers:
         ch = logging.StreamHandler()
@@ -197,14 +285,14 @@ def orchestrate_test(args):
     run = aim.Run(experiment=f"DIVA_{args.dataset.upper()}")
     run["hparams"] = vars(args)
 
-    # 1. Setup Paths
     base_folder = os.path.join("data", "test", args.dataset)
     paths = {
         'npz_path': os.path.join(base_folder, f"{args.dataset}.npz"),
         'clean_dir': os.path.join(base_folder, "clean_data"),
+        'raw_dir': os.path.join(base_folder, "raw_images"),
         'svd_model_path': os.path.join(base_folder, "models", f"svd_{args.truncated}.joblib"),
         'plots_dir': os.path.join(base_folder, "plots"),
-        'test_db_path': "data/test_meta_database.csv"  # Universal Test DB
+        'test_db_path': "data/test_meta_database.csv"
     }
     os.makedirs(paths['plots_dir'], exist_ok=True)
 
@@ -214,38 +302,39 @@ def orchestrate_test(args):
         clean_csv_path = step1_prepare_clean_data(args, paths, logger)
         dataname = Path(clean_csv_path).stem
         
-        # Step 2: Poisoning
-        logger.info("--- Step 2: Executing Poisoning ---")
-        if args.method not in POISONER_MAP:
-            raise ValueError(f"Method {args.method} not found in POISONER_MAP.")
-            
-        poisoner = POISONER_MAP[args.method](base_folder=base_folder)
-        advx_range = np.arange(0.0, 0.41, args.step)
+        # Step 2: Poisoning (Loop over all selected methods)
+        logger.info(f"--- Step 2: Executing Poisoning for methods: {methods_to_run} ---")
+        all_generated_meta = []
+        advx_range = np.arange(0.0, args.max, args.step)
         
-        # The base_poisoner now strictly returns a list of metadata dicts
-        generated_meta = poisoner.apply_poisoning(clean_csv_path, advx_range)
+        for method in methods_to_run:
+            if method not in POISONER_MAP:
+                logger.warning(f"Method '{method}' not found in POISONER_MAP. Skipping.")
+                continue
+                
+            poisoner = POISONER_MAP[method](base_folder=base_folder)
+            generated_meta = poisoner.apply_poisoning(clean_csv_path, advx_range)
+            if generated_meta:
+                all_generated_meta.extend(generated_meta)
         
-        if not generated_meta:
-            logger.warning("No metadata returned by poisoner.")
+        if not all_generated_meta:
+            logger.warning("No metadata returned by any poisoners.")
             return
 
         # Step 3: Compute C-Measures & Append to DB
         logger.info("--- Step 3: Extracting C-Measures & Updating DB ---")
-        paths_to_compute = [m["Path"] for m in generated_meta]
-        cmeasures_df = compute_cmeasures(paths_to_compute, db_path=paths['test_db_path'])
-        append_to_db(paths['test_db_path'], generated_meta, cmeasures_df)
+        paths_to_compute = [m["Path"] for m in all_generated_meta]
+        cmeasures_df = compute_cmeasures(paths_to_compute, db_path=paths['test_db_path'], workers=args.workers)
+        append_to_db(paths['test_db_path'], all_generated_meta, cmeasures_df)
 
         # Step 4: Load Meta-Learner & Evaluate
-        logger.info("--- Step 4: Binary Meta-Classifier Evaluation ---")
-        logger.info(f"Loading Meta-Learner from {args.metalearner}")
+        logger.info("--- Step 4: Multi-Method Meta-Classifier Evaluation ---")
         clf = joblib.load(args.metalearner)
 
-        # Read the newly updated Test Database
         df_test = pd.read_csv(paths['test_db_path'])
         
-        # Filter strictly for the exact dataset and method we just generated
-        df_eval = df_test[(df_test['Data'] == dataname) & (df_test['Method'] == poisoner.name)].copy()
-        df_eval.sort_values(by='Rate', inplace=True)
+        # Filter for the dataset and ALL tested methods
+        df_eval = df_test[(df_test['Data'] == dataname) & (df_test['Method'].isin(methods_to_run))].copy()
 
         if df_eval.empty:
             logger.error("Could not find generated records in the database for evaluation.")
@@ -254,7 +343,6 @@ def orchestrate_test(args):
         drop_cols = ['Data', 'Path', 'Method', 'Rate', 'Is_Poisoned', 'error']
         feature_cols = [c for c in df_eval.columns if c not in drop_cols]
         
-        # Ensure model features align
         if hasattr(clf, 'feature_names_in_'):
             missing_cols = set(clf.feature_names_in_) - set(feature_cols)
             for col in missing_cols:
@@ -265,32 +353,38 @@ def orchestrate_test(args):
 
         y_actual = df_eval['Is_Poisoned'].values
         rates = df_eval['Rate'].values
+        methods_eval = df_eval['Method'].values
         
         y_pred = clf.predict(X_eval)
         y_prob = clf.predict_proba(X_eval)[:, 1]
 
-        eval_rates = []
-        eval_confs = []
-
-        for r, actual, pred, prob in zip(rates, y_actual, y_pred, y_prob):
+        # Log results cleanly
+        for m, r, actual, pred, prob in zip(methods_eval, rates, y_actual, y_pred, y_prob):
             confidence = prob * 100
             correct = bool(actual) == bool(pred)
-            logger.info(f"Rate {r:.2f} | Actual: {bool(actual):<5} | Pred: {bool(pred):<5} | Confidence: {confidence:5.2f}% | Correct: {correct}")
-            
-            # Aim Tracking
-            run.track(confidence, name='detection_confidence', context={'rate': r, 'method': args.method})
-            eval_rates.append(r)
-            eval_confs.append(confidence)
+            logger.info(f"[{m.upper()}] Rate {r:.2f} | Actual: {bool(actual):<5} | Pred: {bool(pred):<5} | Conf: {confidence:5.2f}% | Correct: {correct}")
+            run.track(confidence, name='detection_confidence', context={'method': m})
 
-        # Generate & Track Plot
-        plot_path = os.path.join(paths['plots_dir'], f"diva_detection_{args.dataset}_{args.method}.png")
-        generate_diva_plot(args, rates, y_actual, y_pred, y_prob, logger, run, plot_path)
+        # Generate & Track the massive grid plot
+        method_str = "all" if not args.methods else "_".join(args.methods)
+        plot_path = os.path.join(paths['plots_dir'], f"diva_detection_{args.dataset}_{method_str}.png")
+        
+        plot_multimethod_confidence(
+            dataset_name=args.dataset, 
+            methods=methods_eval, 
+            rates=rates, 
+            ground_truths=y_actual, 
+            predictions=y_pred, 
+            probabilities=y_prob, 
+            logger=logger, 
+            aim_run=run, 
+            plot_path=plot_path
+        )
 
         logger.info("DIVA Evaluation Pipeline completed successfully.")
 
     except Exception as e:
         logger.error(f"Pipeline failed: {e}", exc_info=True)
-        run.close()
         raise e
     finally:
         run.close()
@@ -298,12 +392,14 @@ def orchestrate_test(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate Meta-Learner tracing on Datasets")
     parser.add_argument("--dataset", type=str, required=True, choices=[e.value for e in DatasetEnum], help="Dataset to process")
-    parser.add_argument("--method", type=str, required=True, choices=list(POISONER_MAP.keys()), help="Poisoning method")
+    parser.add_argument("--methods", nargs='+', type=str, default=None, choices=list(POISONER_MAP.keys()), help="Poisoning methods to test. Defaults to ALL if omitted.")
     parser.add_argument("--max_sample", type=int, default=2000, help="Max samples to retain after downsampling")
     parser.add_argument("--truncated", type=int, default=100, help="SVD truncation components")
     parser.add_argument("--step", type=float, default=0.1, help="Adversarial rate step size (e.g., 0.1 for 10%, 20%, 30%)")
+    parser.add_argument("--max", type=float, default=0.41, help="Max rate step size")
     parser.add_argument("--metalearner", type=str, default="data/universal_meta_classifier_xgb.joblib", help="Path to meta-classifier")
     parser.add_argument("--description", type=str, default="", help="Description for tracking/logging purposes")
+    parser.add_argument("--workers", type=int, default=None, help="Number of workers for computing cmeasures")
 
     args = parser.parse_args()
     orchestrate_test(args)
