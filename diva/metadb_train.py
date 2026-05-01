@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import time
 import hashlib
+from enum import Enum
 
 from sklearn.datasets import make_classification
 from sklearn.preprocessing import StandardScaler
@@ -39,6 +40,8 @@ from scripts.svm_art.svm_art_generate_metadb import ArtSvmPoisoner
 from scripts.svm_biggio.svm_biggio_generate_metadb import BiggioSvmPoisoner
 from scripts.svm_feature_collision.svm_featurecollision import FeatureCollisionPoisoner
 from scripts.witches_brew.witches_brew_generate_metadb import WitchesBrewPoisoner
+from scripts.poison_frogs.poison_frogs_generate_metadb import PoisonFrogsPoisoner
+from scripts.bullseye_polytope.bullseye_polytope_generate_metadb import BullseyePolytopePoisoner
 from scripts.data_generator.image_fetcher import fetch_and_binarize_images
 from scripts.data_generator.openml_fetcher import fetch_openml_datasets
 
@@ -50,15 +53,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger("DIVA_Training_Orchestrator")
 
+# ==========================================
+# Task Modality Configuration
+# ==========================================
+class TaskModality(str, Enum):
+    TABULAR_BINARY = "tabular_binary"
+    IMAGE_BINARY = "image_binary"
+    IMAGE_MULTICLASS = "image_multiclass" # Ready for your future expansion
+
+MODALITY_CONFIG = {
+    TaskModality.TABULAR_BINARY: {
+        "db_path": "data/meta_db_tabular.csv",
+        "model_path": "data/meta_classifier_tabular.joblib",
+        "valid_sources": ["synthetic", "openml", None],
+        "valid_poisoners": ["alfa_svm", "feature_noise_svm", "random_flip_svm", "feature_collision", "biggio_svm"]
+    },
+    TaskModality.IMAGE_BINARY: {
+        "db_path": "data/meta_db_image.csv",
+        "model_path": "data/meta_classifier_image.joblib",
+        "valid_sources": ["cifar10", "cifar100", "svhn", "mnist", "fashion_mnist", None],
+        "valid_poisoners": ["witches_brew", "poison_frogs", "bullseye_polytope"] 
+    },
+    TaskModality.IMAGE_MULTICLASS: {
+        "db_path": "data/meta_db_image_multi.csv",
+        "model_path": "data/meta_classifier_image_multi.joblib",
+        "valid_sources": ["cifar10", "cifar100", "svhn", None],
+        "valid_poisoners": ["witches_brew", "poison_frogs", "bullseye_polytope"]
+    }
+}
+
 POISONER_MAP = {
     "alfa_svm": AlfaPoisoner,
     "feature_noise_svm": FeatureNoisePoisoner,
     "random_flip_svm": RandomFlipPoisoner,
-    #"poissvm_svm": PoisSVMPoisoner,
     "biggio_svm": BiggioSvmPoisoner,
-    #"art_svm": ArtSvmPoisoner,
     "feature_collision": FeatureCollisionPoisoner,
-    "witches_brew": WitchesBrewPoisoner
+    "witches_brew": WitchesBrewPoisoner,
+    "poison_frogs": PoisonFrogsPoisoner,
+    "bullseye_polytope": BullseyePolytopePoisoner
 }
 
 def generate_synthetic_data(n_sets, folder):
@@ -100,32 +132,46 @@ def generate_synthetic_data(n_sets, folder):
 
     return generated_files
 
-def augment_training_db(db_path, base_folder, n_datasets, n_attacks, workers, source, methods):
-    """Orchestrates creating new data and adding it to the Universal Training DB"""
-    # 1. Fetch/Generate Data and Enforce Modality Boundaries
-    if source == "synthetic":
-        new_clean_files = generate_synthetic_data(n_datasets, base_folder)
-        # Prevent image attacks on tabular data
-        if methods and "witches_brew" in methods:
-            methods.remove("witches_brew")
-            
-    elif source == "openml":
-        new_clean_files = fetch_openml_datasets(n_datasets, base_folder, db_path=db_path)
-        # Prevent image attacks on tabular data
-        if methods and "witches_brew" in methods:
-            methods.remove("witches_brew")
-            
-    elif source == "cifar":
-        new_clean_files = fetch_and_binarize_images(n_max=n_datasets, base_folder=base_folder, db_path=db_path)
-        methods = ["witches_brew"]
-        logger.info("Modality boundary enforced: Pipeline restricted exclusively to 'witches_brew' for CIFAR-10 .pt files.")
 
-    advx_range = np.round(np.arange(0.1, 0.41, 0.05), 2)
+def augment_training_db(config, base_folder, n_datasets, n_attacks, workers, source, methods):
+    """Orchestrates creating new data and adding it to the Modality-Specific Training DB"""
+    db_path = config["db_path"]
     
-    # Create a pool of ALL possible (method, rate) tuples
+    allowed_methods = config["valid_poisoners"]
+    if methods:
+        methods = [m for m in methods if m in allowed_methods]
+    else:
+        methods = allowed_methods
+
+    if not methods:
+        logger.error(f"No valid methods selected for modality. Allowed: {allowed_methods}")
+        return
+
+    # 2. Modality Routing
+    if config == MODALITY_CONFIG[TaskModality.TABULAR_BINARY]:
+        if source == "openml":
+            new_clean_files = fetch_openml_datasets(n_datasets, base_folder, db_path=db_path)
+        else: # default to synthetic
+            new_clean_files = generate_synthetic_data(n_datasets, base_folder)
+            
+    elif config == MODALITY_CONFIG[TaskModality.IMAGE_BINARY]:
+        # If no source provided, use ALL valid image sources!
+        sources_to_use = [source] if source else config["valid_sources"]
+        
+        new_clean_files = fetch_and_binarize_images(
+            sources=sources_to_use, 
+            n_max=n_datasets, 
+            base_folder=base_folder, 
+            db_path=db_path
+        )
+
+    #advx_range = np.round(np.arange(0.1, 0.41, 0.05), 2)
+    advx_range = [0.01, 0.03, 0.05, 0.08, 0.10]
+    
+    # Create a pool of ALL possible (method, rate) tuples valid for this modality
     all_possible_attacks = [
         (m, r) for m in POISONER_MAP.keys() 
-        if (methods is None or m in methods) 
+        if m in methods 
         for r in advx_range
     ]
     
@@ -135,29 +181,22 @@ def augment_training_db(db_path, base_folder, n_datasets, n_attacks, workers, so
         dataname = Path(file).stem
         all_generated_metadata.append({"Data": dataname, "Path": file, "Method": "clean", "Rate": 0.0, "Is_Poisoned": 0})
         
-        # Sample exactly n_attacks combinations from the global pool
+        # Sample exactly n_attacks combinations from the modality pool
         chosen_attacks = random.sample(all_possible_attacks, min(n_attacks, len(all_possible_attacks)))
 
-        logger.info(f"Chosen attacks: {chosen_attacks}")
+        logger.info(f"Chosen attacks for {dataname}: {chosen_attacks}")
         
-        # Group the randomly chosen combinations by method 
-        # so we can pass the specific list of rates to the poisoner's apply_poisoning function
         attack_plan = {}
         for method, rate in chosen_attacks:
             attack_plan.setdefault(method, []).append(rate)
             
-        # Execute the specific rates for each method
         for method, rates in attack_plan.items():
             poisoner = POISONER_MAP[method](base_folder=base_folder)
-            
-            # Pass only the specifically sampled rates, sorted chronologically 
             generated_meta = poisoner.apply_poisoning(file, sorted(rates))
             if generated_meta:
                 all_generated_metadata.extend(generated_meta)
 
     paths_to_compute = [m["Path"] for m in all_generated_metadata]
-    
-    # Compute using the db_path to instantly skip files already processed
     cmeasures_df = compute_cmeasures(paths_to_compute, workers=workers, db_path=db_path)
     append_to_db(db_path, all_generated_metadata, cmeasures_df)
 
@@ -165,15 +204,11 @@ def retrain_metalearner(db_path, model_save_path, aim_run, methods_filter=None):
     logger.info(f"--- Retraining Meta-Learner on Augmented DB: {db_path} ---")
     df = pd.read_csv(db_path)
     
-    # --- ADDED: Filter by method and dynamically rename the save path ---
     if methods_filter:
         df = df[df['Method'].isin(methods_filter) | (df['Method'] == 'clean')].copy()
-        
-        # Append methods to the filename (e.g., model_alfa_svm_biggio_svm.joblib)
         base, ext = os.path.splitext(model_save_path)
         model_save_path = f"{base}_{'_'.join(methods_filter)}{ext}"
         logger.info(f"Filtered training to methods: {methods_filter}. Output: {model_save_path}")
-    # -------------------------------------------------------------------
     
     drop_cols = ['Data', 'Path', 'Method', 'Rate', 'Is_Poisoned', 'error']
     drop_cols += [c for c in df.columns if c in ['Train.Clean', 'Test.Clean', 'Train.Poison', 'Test.Poison']]
@@ -185,7 +220,6 @@ def retrain_metalearner(db_path, model_save_path, aim_run, methods_filter=None):
     y = df['Is_Poisoned']
     groups = df['Data']
     
-    # Capture Metadata for granular testing before dropping
     methods = df['Method']
     rates = df['Rate']
     datasets = df['Data']
@@ -196,7 +230,6 @@ def retrain_metalearner(db_path, model_save_path, aim_run, methods_filter=None):
     X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
     y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
     
-    # Extract test metadata
     y_test_vals = y_test.values
     methods_test = methods.iloc[test_idx].values
     rates_test = rates.iloc[test_idx].values
@@ -222,7 +255,6 @@ def retrain_metalearner(db_path, model_save_path, aim_run, methods_filter=None):
     aim_run.track(acc_rf, name="Accuracy", context={"model": "RandomForest", "subset": "global"})
     aim_run.track(auc_rf, name="ROC_AUC", context={"model": "RandomForest", "subset": "global"})
     
-    # Generate and Track RF Visualizations
     rf_cm_path = os.path.join(plots_dir, "rf_confusion_matrix.png")
     plot_confusion_matrix(y_test_vals, y_pred_rf, "Random Forest", rf_cm_path)
     aim_run.track(aim.Image(rf_cm_path), name='Confusion_Matrix', context={"model": "RandomForest"})
@@ -264,7 +296,6 @@ def retrain_metalearner(db_path, model_save_path, aim_run, methods_filter=None):
     aim_run.track(acc_xgb, name="Accuracy", context={"model": "XGBoost", "subset": "global"})
     aim_run.track(auc_xgb, name="ROC_AUC", context={"model": "XGBoost", "subset": "global"})
     
-    # Generate and Track XGB Visualizations
     xgb_cm_path = os.path.join(plots_dir, "xgb_confusion_matrix.png")
     plot_confusion_matrix(y_test_vals, y_pred_xgb, "XGBoost", xgb_cm_path)
     aim_run.track(aim.Image(xgb_cm_path), name='Confusion_Matrix', context={"model": "XGBoost"})
@@ -285,7 +316,6 @@ def retrain_metalearner(db_path, model_save_path, aim_run, methods_filter=None):
     plot_all_confidence_curves(datasets_test, methods_test, rates_test, y_prob_xgb, "XGBoost", xgb_curves_path)
     aim_run.track(aim.Image(xgb_curves_path), name='Confidence_Curves', context={"model": "XGBoost"})
     
-    # Log numerical accuracy explicitly for each method to Aim Metrics
     for method in np.unique(methods_test):
         mask = (methods_test == method)
         if sum(mask) > 0:
@@ -294,36 +324,54 @@ def retrain_metalearner(db_path, model_save_path, aim_run, methods_filter=None):
             aim_run.track(method_acc_rf, name="Accuracy_by_Method", context={"model": "RandomForest", "method": method})
             aim_run.track(method_acc_xgb, name="Accuracy_by_Method", context={"model": "XGBoost", "method": method})
     
-    # FIX: Save to a different path so it doesn't overwrite the RF model
     xgb_save_path = model_save_path.replace(".joblib", "_xgb.joblib")
     joblib.dump(clf_xgb, xgb_save_path)
     
     logger.info(f"✅ Models saved to: {model_save_path} and {xgb_save_path}")
 
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DIVA Meta-Learner Training Pipeline")
-    parser.add_argument("--db_path", type=str, default="data/universal_meta_database.csv", help="Path to master DB")
-    parser.add_argument("--model_path", type=str, default="data/universal_meta_classifier.joblib", help="Path to save models")
+    
+    # --- Modality and Routing Arguments ---
+    parser.add_argument("--modality", type=str, required=True, choices=[e.value for e in TaskModality], help="The core task modality to train/test.")
+    parser.add_argument("--source", type=str, default=None, help="Specific dataset source (e.g., openml, cifar10). Must match modality.")
+    
+    # --- Standard Arguments ---
     parser.add_argument("--add_datasets", type=int, default=0, help="Number of new datasets to process")
-    parser.add_argument("--source", type=str, default="synthetic", choices=["synthetic", "openml", "cifar"], help="Dataset source")
     parser.add_argument("--base_folder", type=str, default="data", help="Data storage folder")
     parser.add_argument("--workers", type=int, default=None, help="Number of CPU cores for PyMFE")
     parser.add_argument("--retrain_only", action="store_true", help="Skip dataset generation and just retrain")
     parser.add_argument("--description", type=str, default="Meta-Learner Training Run", help="Aim run description")
     parser.add_argument("--n_attacks", type=int, default=4, help="Number of attacks per clean dataset")
     parser.add_argument("--methods", nargs='+', type=str, default=None, help="Filter by methods")
+    
+    # --- Path Overrides (Optional) ---
+    parser.add_argument("--db_path", type=str, default=None, help="Override path to master DB")
+    parser.add_argument("--model_path", type=str, default=None, help="Override path to save models")
     args = parser.parse_args()
 
-    run = aim.Run(experiment="DIVA_MetaLearner_Training")
+    # 1. Load Modality Config
+    config = MODALITY_CONFIG[TaskModality(args.modality)]
+    
+    # 2. Resolve Paths
+    db_path = args.db_path if args.db_path else config["db_path"]
+    model_path = args.model_path if args.model_path else config["model_path"]
+
+    # 3. Safety Checks
+    if args.add_datasets > 0 and not args.retrain_only:
+        if args.source not in config["valid_sources"]:
+            raise ValueError(f"Source '{args.source}' is invalid for modality '{args.modality}'. Valid sources: {config['valid_sources']}")
+
+    run = aim.Run(experiment=f"DIVA_MetaLearner_{args.modality.upper()}")
     run["hparams"] = vars(args)
 
     try:
         if args.add_datasets > 0 and not args.retrain_only:
-            augment_training_db(args.db_path, args.base_folder, args.add_datasets, n_attacks=args.n_attacks, workers=args.workers, source=args.source, methods=args.methods)
+            # Note: We now pass the 'config' dictionary to augment_training_db
+            augment_training_db(config, args.base_folder, args.add_datasets, args.n_attacks, args.workers, args.source, args.methods)
 
-        retrain_metalearner(args.db_path, args.model_path, aim_run=run, methods_filter=args.methods)
+        retrain_metalearner(db_path, model_path, aim_run=run, methods_filter=args.methods)
         
     except Exception as e:
         logger.error(f"Training pipeline failed: {e}", exc_info=True)

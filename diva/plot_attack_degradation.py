@@ -1,153 +1,133 @@
-import os
-import re
-import argparse
-import logging
-from pathlib import Path
-
-import numpy as np
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from tqdm import tqdm
-
-from sklearn.svm import SVC
+from sklearn.neural_network import MLPClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
+import os
+from tqdm import tqdm
 
-# Setup Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(message)s', datefmt='%H:%M:%S')
-logger = logging.getLogger("Visualizer")
-
-def load_data(file_path):
-    """Safely loads CSV and splits X (features) and y (target)."""
-    df = pd.read_csv(file_path)
-    X = df.iloc[:, :-1].values
-    y = df.iloc[:, -1].values
-    return X, y
-
-def evaluate_degradation(clean_file_path, poisoned_dir="data/poisoned_data"):
-    # 1. Setup paths and regex
-    clean_path = Path(clean_file_path)
-    base_name = clean_path.stem
-    poisoned_dir_path = Path(poisoned_dir)
-
-    if not clean_path.exists():
-        raise FileNotFoundError(f"Could not find clean file: {clean_file_path}")
-
-    logger.info(f"Analyzing dataset: {base_name}")
-
-    # Regex explanation:
-    # ^ matches start of string
-    # {base_name}_ matches the exact dataset name followed by an underscore
-    # (.+) captures the method name (e.g., 'alfa_svm', 'randomlabelflip_svm')
-    # _([0-9]+\.[0-9]+) captures the rate (e.g., '_0.20')
-    # \.csv$ matches the extension at the end
-    pattern = re.compile(rf"^{re.escape(base_name)}_(.+)_([0-9]+\.[0-9]+)\.csv$")
-
-    # 2. Get the Clean Baseline
-    X_clean, y_clean = load_data(clean_path)
-    
-    # Create the strict, clean test set
-    X_train_c, X_test_c, y_train_c, y_test_c = train_test_split(
-        X_clean, y_clean, test_size=0.2, random_state=42
-    )
-
-    logger.info("Training clean baseline model...")
-    clf_baseline = SVC(kernel='linear')
-    clf_baseline.fit(X_train_c, y_train_c)
-    baseline_acc = accuracy_score(y_test_c, clf_baseline.predict(X_test_c))
-    logger.info(f"Baseline Accuracy: {baseline_acc * 100:.2f}%")
-
-    # 3. Find all poisoned variants using recursive glob (rglob)
-    all_files = list(poisoned_dir_path.rglob(f"{base_name}_*.csv"))
-    
-    if not all_files:
-        logger.warning("No poisoned files found for this dataset!")
+def evaluate_attack_success_rate_mlp(meta_db_path="data/meta_db_image.csv"):
+    if not os.path.exists(meta_db_path):
+        print(f"Error: Could not find {meta_db_path}. Please check the path.")
         return
-
+        
+    print(f"Loading metadata from {meta_db_path}...")
+    meta_df = pd.read_csv(meta_db_path)
+    
     results = []
     
-    # 4. Loop through and evaluate each poisoned file
-    logger.info(f"Found {len(all_files)} poisoned variants. Evaluating...")
-    for file in tqdm(all_files, ncols=100):
-        match = pattern.match(file.name)
+    # Filter for our specific targeted attacks
+    targeted_methods = ['witches_brew', 'poison_frogs', 'bullseye_polytope']
+    attack_df = meta_df[meta_df['Method'].isin(targeted_methods)]
+    
+    if attack_df.empty:
+        print("No targeted attack datasets found in the MetaDB.")
+        return
+
+    for _, row in tqdm(attack_df.iterrows(), total=len(attack_df), desc="Evaluating ASR with MLP"):
+        csv_path = row['Path']
+        method = row['Method']
+        rate = row['Rate']
+        dataset_name = row['Data']
         
-        if match:
-            method = match.group(1)
-            rate = float(match.group(2))
+        if not os.path.exists(csv_path):
+            continue
             
-            try:
-                # Load poisoned data
-                X_p, y_p = load_data(file)
-                
-                # Train compromised model
-                clf_compromised = SVC(kernel='linear')
-                clf_compromised.fit(X_p, y_p)
-                
-                # Test on the CLEAN test set
-                acc = accuracy_score(y_test_c, clf_compromised.predict(X_test_c))
-                
-                results.append({
-                    "Method": method.replace("_svm", "").replace("injection", "").upper(),
-                    "Rate": rate,
-                    "Accuracy": acc
-                })
-            except Exception as e:
-                logger.error(f"Failed on {file.name}: {e}")
-
-    # 5. Add the baseline (0% rate) for all methods so the plot starts cohesively
-    df_results = pd.DataFrame(results)
-    methods = df_results['Method'].unique()
-    for m in methods:
-        # Check if rate 0.0 already exists, if not, inject the baseline
-        if not ((df_results['Method'] == m) & (df_results['Rate'] == 0.0)).any():
-            df_results = pd.concat([df_results, pd.DataFrame([{"Method": m, "Rate": 0.0, "Accuracy": baseline_acc}])], ignore_index=True)
-
-    # 6. Plotting
-    logger.info("Generating plot...")
-    plt.figure(figsize=(10, 6))
+        # 1. Load the poisoned training data
+        train_data = pd.read_csv(csv_path)
+        X_train = train_data.drop('y', axis=1).values
+        y_train = train_data['y'].values
+        
+        # 2. Train the Victim Model (2-Layer Non-Linear MLP)
+        # Using 256 and 128 neurons to model complex latent space geometries
+        clf = MLPClassifier(
+            hidden_layer_sizes=(256, 128), 
+            activation='relu', 
+            solver='adam', 
+            max_iter=1000, 
+            random_state=42
+        )
+        clf.fit(X_train, y_train)
+        
+        # 3. Locate the Target Image(s)
+        clean_row = meta_df[(meta_df['Data'] == dataset_name) & (meta_df['Method'] == 'clean')]
+        if clean_row.empty:
+            continue
+            
+        clean_csv_path = clean_row.iloc[0]['Path']
+        clean_data = pd.read_csv(clean_csv_path)
+        
+        X_clean = clean_data.drop('y', axis=1).values
+        y_clean = clean_data['y'].values
+        
+        # Our poisoners always target the FIRST Class 1 image in the clean dataset array
+        idx_1 = np.where(y_clean == 1)[0]
+        if len(idx_1) == 0:
+            continue
+            
+        target_idx = idx_1[0]
+        target_latent = X_clean[target_idx].reshape(1, -1)
+        
+        # 4. Measure Attack Success Rate (ASR)
+        target_prediction = clf.predict(target_latent)[0]
+        attack_success = 1 if target_prediction == 0 else 0
+        
+        # 5. Measure Clean Accuracy (Stealth)
+        _, X_test_clean, _, y_test_clean = train_test_split(
+            X_clean, y_clean, test_size=0.3, random_state=42, stratify=y_clean
+        )
+        clean_acc = accuracy_score(y_test_clean, clf.predict(X_test_clean))
+        
+        results.append({
+            'Dataset': dataset_name,
+            'Method': method,
+            'Rate': rate,
+            'ASR': attack_success,
+            'Clean Test Accuracy': clean_acc
+        })
+            
+    results_df = pd.DataFrame(results)
     
-    # Set a clean Seaborn style
+    if results_df.empty:
+        print("No valid data found to plot. Check your CSV paths.")
+        return
+        
+    # Aggregate results
+    agg_df = results_df.groupby(['Method', 'Rate']).agg(
+        Mean_ASR=('ASR', lambda x: np.mean(x) * 100), 
+        Mean_Clean_Acc=('Clean Test Accuracy', lambda x: np.mean(x) * 100)
+    ).reset_index()
+    
+    # --- Plotting ---
     sns.set_theme(style="whitegrid")
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
     
-    # Create the lineplot
+    # Plot 1: Attack Success Rate (ASR)
     sns.lineplot(
-        data=df_results, 
-        x="Rate", 
-        y="Accuracy", 
-        hue="Method", 
-        style="Method", 
-        markers=True, 
-        dashes=False, 
-        linewidth=2.5,
-        markersize=8
+        data=agg_df, x='Rate', y='Mean_ASR', hue='Method', 
+        marker='o', linewidth=3, markersize=10, ax=ax1
     )
+    ax1.set_title("Attack Success Rate (MLP Target Model)", fontsize=14, fontweight='bold')
+    ax1.set_xlabel("Poisoning Rate", fontsize=12)
+    ax1.set_ylabel("ASR (%)", fontsize=12)
+    ax1.set_ylim(-5, 105)
     
-    # Add baseline reference line
-    plt.axhline(baseline_acc, color='red', linestyle='--', linewidth=2, label='Clean Baseline')
+    # Plot 2: Clean Test Accuracy (Stealth)
+    sns.lineplot(
+        data=agg_df, x='Rate', y='Mean_Clean_Acc', hue='Method', 
+        marker='s', linewidth=2, linestyle='--', ax=ax2
+    )
+    ax2.set_title("MLP Overall Accuracy (Stealth)", fontsize=14, fontweight='bold')
+    ax2.set_xlabel("Poisoning Rate", fontsize=12)
+    ax2.set_ylabel("Overall Accuracy (%)", fontsize=12)
+    ax2.set_ylim(85, 100) 
     
-    # Formatting
-    plt.title(f"Model Degradation vs. Poisoning Rate\nDataset: {base_name}", fontsize=14, fontweight='bold')
-    plt.xlabel("Poisoning Rate", fontsize=12)
-    plt.ylabel("Accuracy on Clean Test Set", fontsize=12)
-    
-    # Ensure X-axis shows percentages nicely
-    plt.xticks(np.sort(df_results['Rate'].unique()))
-    
-    plt.legend(title="Attack Method", bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.tight_layout()
-    
-    # Save and show
-    output_img = f"degradation_plot_{base_name}.png"
-    plt.savefig(output_img, dpi=300, bbox_inches='tight')
-    logger.info(f"Plot saved to {output_img}")
-    plt.show()
+    save_path = "attack_asr_mlp_evaluation.png"
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"\n✅ Evaluation complete. Plot saved to {save_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Plot attack degradation for a specific dataset.")
-    parser.add_argument("-c", "--clean_file", required=True, type=str, help="Path to the specific clean CSV file.")
-    parser.add_argument("-p", "--poison_dir", default="data/poisoned_data", type=str, help="Base directory containing poisoned files.")
-    
-    args = parser.parse_args()
-    
-    evaluate_degradation(args.clean_file, args.poison_dir)
+    evaluate_attack_success_rate_mlp(meta_db_path="data/meta_db_image.csv")
