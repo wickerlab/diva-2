@@ -21,7 +21,7 @@ def get_dynamic_image_sources(n_sources):
     datasets = api.list_datasets(
         filter="task_categories:image-classification", 
         sort="downloads",
-        limit=100 + n_sources * 3
+        limit=n_sources * 3
     )
     return [d.id for d in datasets]
 
@@ -58,7 +58,7 @@ def fetch_and_binarize_images(sources, n_max, base_folder="data", db_path=None, 
     MAX_DOWNLOAD_SIZE_GB = 1.5
     MAX_POINTS_NEEDED = 5000
 
-    for src in sources[100:]:
+    for src in sources:
         if count_selected >= n_max:
             break
             
