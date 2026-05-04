@@ -8,8 +8,39 @@ import numpy as np
 import pandas as pd
 import random
 import torch
+import threading
+import queue
 
 logger = logging.getLogger(__name__)
+
+class BackgroundPrefetcher:
+    """
+    Wraps any Python generator in a background thread.
+    Downloads the next 'max_prefetch' items while the main thread is busy processing.
+    """
+    def __init__(self, generator, max_prefetch=3):
+        self.generator = generator
+        self.queue = queue.Queue(maxsize=max_prefetch)
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            for item in self.generator:
+                self.queue.put(item) # Pauses here if queue is full
+        except Exception as e:
+            print(f"Background fetcher encountered an error: {e}")
+        finally:
+            self.queue.put(None) # Send termination signal
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self.queue.get()
+        if item is None:
+            raise StopIteration
+        return item
 
 def log_cols(path_data):
     """Read data from a CSV file, output the column names"""

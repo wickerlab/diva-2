@@ -23,7 +23,7 @@ from xgboost import XGBClassifier
 from scripts.cmeasures import compute_cmeasures
 from scripts.meta_db import append_to_db
 from scripts.utils.plots import *
-from scripts.utils.utils import set_global_seed
+from scripts.utils.utils import set_global_seed, BackgroundPrefetcher
 
 # --- Import your Specific Poisoners ---
 from scripts.svm_poissvm.svm_poissvm_generate_metadb import PoisSVMPoisoner
@@ -38,6 +38,7 @@ from scripts.poison_frogs.poison_frogs_generate_metadb import PoisonFrogsPoisone
 from scripts.bullseye_polytope.bullseye_polytope_generate_metadb import BullseyePolytopePoisoner
 from scripts.badnets.badnet_generate_metadb import BadNetsPoisoner
 from scripts.learning_to_confuse.learning_to_confude_generate_metadb import AutoEncoderPoisoner
+from scripts.metapoison.metapoison_generate_metadb import MetaPoisonPoisoner
 from scripts.data_generator.image_fetcher import fetch_and_binarize_images
 from scripts.data_generator.openml_fetcher import fetch_openml_datasets
 
@@ -48,6 +49,7 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger("DIVA_Training_Orchestrator")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ==========================================
 # Task Modality Configuration
@@ -69,11 +71,12 @@ MODALITY_CONFIG = {
         "model_path": "data/meta_classifier_image.joblib",
         "valid_sources": ["svhn", "mnist", "fashion_mnist", None],
         "valid_poisoners": [
-            "witches_brew",
-            "poison_frogs",
-            "random_flip_svm",
-            "badnets",
-            "autoencoder"
+            #"witches_brew",
+            #"poison_frogs",
+            #"random_flip_svm",
+            #"badnets",
+            #"autoencoder",
+            "metapoison"
         ] 
     },
     TaskModality.IMAGE_MULTICLASS: {
@@ -95,6 +98,7 @@ POISONER_MAP = {
     "bullseye_polytope": BullseyePolytopePoisoner,
     "badnets": BadNetsPoisoner,
     "autoencoder": AutoEncoderPoisoner,
+    "metapoison": MetaPoisonPoisoner,
 }
 
 def generate_synthetic_data(n_sets, folder):
@@ -137,7 +141,7 @@ def generate_synthetic_data(n_sets, folder):
     return generated_files
 
 
-def augment_training_db(config, base_folder, n_datasets, n_attacks, workers, source, methods):
+def augment_training_db(config, base_folder, n_datasets, n_attacks, workers, source, methods, max_pair):
     """Orchestrates creating new data and adding it to the Modality-Specific Training DB"""
     db_path = config["db_path"]
     
@@ -159,15 +163,14 @@ def augment_training_db(config, base_folder, n_datasets, n_attacks, workers, sou
             new_clean_files = generate_synthetic_data(n_datasets, base_folder)
             
     elif config == MODALITY_CONFIG[TaskModality.IMAGE_BINARY]:
-        # If no source provided, use ALL valid image sources!
-        sources_to_use = [source] if source else config["valid_sources"]
-        
-        new_clean_files = fetch_and_binarize_images(
-            sources=sources_to_use, 
+        raw_generator = fetch_and_binarize_images(
+            sources=source, 
             n_max=n_datasets, 
             base_folder=base_folder, 
-            db_path=db_path
+            db_path=db_path,
+            max_pair=max_pair
         )
+        new_clean_files = BackgroundPrefetcher(raw_generator, max_prefetch=2*max_pair-1)
 
     advx_range = np.round(np.arange(0.05, 0.31, 0.05), 2)
     #advx_range = [0.01, 0.03, 0.05, 0.08, 0.10]
@@ -180,7 +183,7 @@ def augment_training_db(config, base_folder, n_datasets, n_attacks, workers, sou
     ]
     
 
-    for file in tqdm.tqdm(new_clean_files):
+    for file in tqdm.tqdm(new_clean_files, total=n_datasets):
         all_generated_metadata = []
         dataname = Path(file).stem
         all_generated_metadata.append({"Data": dataname, "Path": file, "Method": "clean", "Rate": 0.0, "Is_Poisoned": 0})
@@ -350,6 +353,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_attacks", type=int, default=4, help="Number of attacks per clean dataset")
     parser.add_argument("--methods", nargs='+', type=str, default=None, help="Filter by methods")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--max_pair", type=int, default=10, help="Max number of pair for splitting a multiclass datasets into multiple binary one")
     
     # --- Path Overrides (Optional) ---
     parser.add_argument("--db_path", type=str, default=None, help="Override path to master DB")
@@ -376,7 +380,7 @@ if __name__ == "__main__":
     try:
         if args.add_datasets > 0 and not args.retrain_only:
             # Note: We now pass the 'config' dictionary to augment_training_db
-            augment_training_db(config, args.base_folder, args.add_datasets, args.n_attacks, args.workers, args.source, args.methods)
+            augment_training_db(config, args.base_folder, args.add_datasets, args.n_attacks, args.workers, args.source, args.methods, args.max_pair)
 
         retrain_metalearner(db_path, model_path, aim_run=run, modality=args.modality, methods_filter=args.methods)
         
