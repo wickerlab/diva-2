@@ -14,6 +14,7 @@ import seaborn as sns
 import time
 import hashlib
 from enum import Enum
+import tqdm
 
 from sklearn.datasets import make_classification
 from sklearn.preprocessing import StandardScaler
@@ -42,6 +43,8 @@ from scripts.svm_feature_collision.svm_featurecollision import FeatureCollisionP
 from scripts.witches_brew.witches_brew_generate_metadb import WitchesBrewPoisoner
 from scripts.poison_frogs.poison_frogs_generate_metadb import PoisonFrogsPoisoner
 from scripts.bullseye_polytope.bullseye_polytope_generate_metadb import BullseyePolytopePoisoner
+from scripts.badnets.badnet_generate_metadb import BadNetsPoisoner
+from scripts.learning_to_confuse.learning_to_confude_generate_metadb import AutoEncoderPoisoner
 from scripts.data_generator.image_fetcher import fetch_and_binarize_images
 from scripts.data_generator.openml_fetcher import fetch_openml_datasets
 
@@ -71,8 +74,8 @@ MODALITY_CONFIG = {
     TaskModality.IMAGE_BINARY: {
         "db_path": "data/meta_db_image.csv",
         "model_path": "data/meta_classifier_image.joblib",
-        "valid_sources": ["cifar10", "cifar100", "svhn", "mnist", "fashion_mnist", None],
-        "valid_poisoners": ["witches_brew", "poison_frogs", "bullseye_polytope"] 
+        "valid_sources": ["svhn", "mnist", "fashion_mnist", None],
+        "valid_poisoners": ["witches_brew", "poison_frogs", "random_flip_svm", "afla_svm", "badnets", "autoencoder"] 
     },
     TaskModality.IMAGE_MULTICLASS: {
         "db_path": "data/meta_db_image_multi.csv",
@@ -90,7 +93,9 @@ POISONER_MAP = {
     "feature_collision": FeatureCollisionPoisoner,
     "witches_brew": WitchesBrewPoisoner,
     "poison_frogs": PoisonFrogsPoisoner,
-    "bullseye_polytope": BullseyePolytopePoisoner
+    "bullseye_polytope": BullseyePolytopePoisoner,
+    "badnets": BadNetsPoisoner,
+    "autoencoder": AutoEncoderPoisoner,
 }
 
 def generate_synthetic_data(n_sets, folder):
@@ -165,8 +170,8 @@ def augment_training_db(config, base_folder, n_datasets, n_attacks, workers, sou
             db_path=db_path
         )
 
-    #advx_range = np.round(np.arange(0.1, 0.41, 0.05), 2)
-    advx_range = [0.01, 0.03, 0.05, 0.08, 0.10]
+    advx_range = np.round(np.arange(0.05, 0.31, 0.05), 2)
+    #advx_range = [0.01, 0.03, 0.05, 0.08, 0.10]
     
     # Create a pool of ALL possible (method, rate) tuples valid for this modality
     all_possible_attacks = [
@@ -175,9 +180,9 @@ def augment_training_db(config, base_folder, n_datasets, n_attacks, workers, sou
         for r in advx_range
     ]
     
-    all_generated_metadata = []
 
-    for file in new_clean_files:
+    for file in tqdm.tqdm(new_clean_files):
+        all_generated_metadata = []
         dataname = Path(file).stem
         all_generated_metadata.append({"Data": dataname, "Path": file, "Method": "clean", "Rate": 0.0, "Is_Poisoned": 0})
         
@@ -196,11 +201,11 @@ def augment_training_db(config, base_folder, n_datasets, n_attacks, workers, sou
             if generated_meta:
                 all_generated_metadata.extend(generated_meta)
 
-    paths_to_compute = [m["Path"] for m in all_generated_metadata]
-    cmeasures_df = compute_cmeasures(paths_to_compute, workers=workers, db_path=db_path)
-    append_to_db(db_path, all_generated_metadata, cmeasures_df)
+        paths_to_compute = [m["Path"] for m in all_generated_metadata]
+        cmeasures_df = compute_cmeasures(paths_to_compute, workers=workers, db_path=db_path)
+        append_to_db(db_path, all_generated_metadata, cmeasures_df)
 
-def retrain_metalearner(db_path, model_save_path, aim_run, methods_filter=None):
+def retrain_metalearner(db_path, model_save_path, aim_run, modality, methods_filter=None):
     logger.info(f"--- Retraining Meta-Learner on Augmented DB: {db_path} ---")
     df = pd.read_csv(db_path)
     
@@ -237,7 +242,7 @@ def retrain_metalearner(db_path, model_save_path, aim_run, methods_filter=None):
     
     logger.info(f"Training on {len(X_train)} samples, testing on {len(X_test)} samples.")
     
-    plots_dir = os.path.join(os.path.dirname(model_save_path), "plots")
+    plots_dir = os.path.join(os.path.dirname(model_save_path), f"plots_{modality}")
     os.makedirs(plots_dir, exist_ok=True)
 
     # ==========================================
@@ -371,7 +376,7 @@ if __name__ == "__main__":
             # Note: We now pass the 'config' dictionary to augment_training_db
             augment_training_db(config, args.base_folder, args.add_datasets, args.n_attacks, args.workers, args.source, args.methods)
 
-        retrain_metalearner(db_path, model_path, aim_run=run, methods_filter=args.methods)
+        retrain_metalearner(db_path, model_path, aim_run=run, modality=args.modality, methods_filter=args.methods)
         
     except Exception as e:
         logger.error(f"Training pipeline failed: {e}", exc_info=True)

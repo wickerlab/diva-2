@@ -1,133 +1,199 @@
-import pandas as pd
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision.models as models
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.neural_network import MLPClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-import os
+from sklearn.linear_model import LogisticRegression
+import warnings
+from sklearn.exceptions import ConvergenceWarning
 from tqdm import tqdm
 
-def evaluate_attack_success_rate_mlp(meta_db_path="data/meta_db_image.csv"):
-    if not os.path.exists(meta_db_path):
-        print(f"Error: Could not find {meta_db_path}. Please check the path.")
-        return
-        
-    print(f"Loading metadata from {meta_db_path}...")
-    meta_df = pd.read_csv(meta_db_path)
-    
-    results = []
-    
-    # Filter for our specific targeted attacks
-    targeted_methods = ['witches_brew', 'poison_frogs', 'bullseye_polytope']
-    attack_df = meta_df[meta_df['Method'].isin(targeted_methods)]
-    
-    if attack_df.empty:
-        print("No targeted attack datasets found in the MetaDB.")
+# Import your core optimization functions
+from scripts.witches_brew.utils.gradient_matching import witches_brew_optimize
+from scripts.poison_frogs.utils.feature_collision import poison_frogs_optimize
+
+def verify_targeted_attacks(clean_pt_path="data/raw_images/cifar10_1_vs_9.pt"):
+    if not os.path.exists(clean_pt_path):
+        print(f"Error: Could not find {clean_pt_path}. Please provide a valid .pt file path.")
         return
 
-    for _, row in tqdm(attack_df.iterrows(), total=len(attack_df), desc="Evaluating ASR with MLP"):
-        csv_path = row['Path']
-        method = row['Method']
-        rate = row['Rate']
-        dataset_name = row['Data']
+    print(f"Loading clean dataset from {clean_pt_path}...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load ResNet18 Latent Extractor
+    resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT).to(device)
+    resnet.eval()
+    latent_extractor = torch.nn.Sequential(*(list(resnet.children())[:-1]))
+
+    # Load Data
+    data = torch.load(clean_pt_path)
+    X_images_clean = data["X"]
+    y_labels_clean = data["y"]
+    
+    idx_0 = torch.where(y_labels_clean == 0)[0]
+    idx_1 = torch.where(y_labels_clean == 1)[0]
+
+    rates = [0.01, 0.03, 0.05, 0.08, 0.10, 0.15, 0.20, 0.30]
+    methods = ["poison_frogs", "witches_brew"]
+    
+    results = []
+
+    # =========================================================
+    # Pre-train Surrogate Model for Witches Brew
+    # =========================================================
+    print("\nPre-training Surrogate Linear Head for Witches Brew...")
+    clean_latents = []
+    with torch.no_grad():
+        for i in range(0, len(X_images_clean), 128):
+            batch = X_images_clean[i:i+128].to(device)
+            clean_latents.append(latent_extractor(batch).squeeze())
+    clean_latents = torch.cat(clean_latents)
+    
+    linear_head = nn.Linear(512, 2).to(device)
+    optimizer = optim.Adam(linear_head.parameters(), lr=0.01)
+    criterion = nn.CrossEntropyLoss()
+    
+    linear_head.train()
+    for _ in range(100):
+        optimizer.zero_grad()
+        outputs = linear_head(clean_latents)
+        loss = criterion(outputs, y_labels_clean.to(device))
+        loss.backward()
+        optimizer.step()
         
-        if not os.path.exists(csv_path):
-            continue
+    linear_head.eval()
+    victim_model = nn.Sequential(latent_extractor, nn.Flatten(), linear_head).eval()
+
+    # =========================================================
+    # Evaluation Loop
+    # =========================================================
+    for method in methods:
+        print(f"\nEvaluating {method.upper()}...")
+        for rate in tqdm(rates, desc=f"Rates for {method}"):
+            n_poison = int(len(X_images_clean) * rate)
+            if n_poison == 0: continue
             
-        # 1. Load the poisoned training data
-        train_data = pd.read_csv(csv_path)
-        X_train = train_data.drop('y', axis=1).values
-        y_train = train_data['y'].values
-        
-        # 2. Train the Victim Model (2-Layer Non-Linear MLP)
-        # Using 256 and 128 neurons to model complex latent space geometries
-        clf = MLPClassifier(
-            hidden_layer_sizes=(256, 128), 
-            activation='relu', 
-            solver='adam', 
-            max_iter=1000, 
-            random_state=42
-        )
-        clf.fit(X_train, y_train)
-        
-        # 3. Locate the Target Image(s)
-        clean_row = meta_df[(meta_df['Data'] == dataset_name) & (meta_df['Method'] == 'clean')]
-        if clean_row.empty:
-            continue
+            # 1. Budget Split (Square Root Rule)
+            n_poison_0 = n_poison // 2
+            n_poison_1 = n_poison - n_poison_0
+            print(n_poison_0)
+            n_targets_1 = max(1, int(np.ceil(np.sqrt(n_poison_0)))) 
+            n_targets_0 = max(1, int(np.ceil(np.sqrt(n_poison_1)))) 
             
-        clean_csv_path = clean_row.iloc[0]['Path']
-        clean_data = pd.read_csv(clean_csv_path)
-        
-        X_clean = clean_data.drop('y', axis=1).values
-        y_clean = clean_data['y'].values
-        
-        # Our poisoners always target the FIRST Class 1 image in the clean dataset array
-        idx_1 = np.where(y_clean == 1)[0]
-        if len(idx_1) == 0:
-            continue
+            # 2. Select Indices
+            base_idx_0 = idx_0[torch.randperm(len(idx_0))[:n_poison_0]]
+            base_idx_1 = idx_1[torch.randperm(len(idx_1))[:n_poison_1]]
             
-        target_idx = idx_1[0]
-        target_latent = X_clean[target_idx].reshape(1, -1)
-        
-        # 4. Measure Attack Success Rate (ASR)
-        target_prediction = clf.predict(target_latent)[0]
-        attack_success = 1 if target_prediction == 0 else 0
-        
-        # 5. Measure Clean Accuracy (Stealth)
-        _, X_test_clean, _, y_test_clean = train_test_split(
-            X_clean, y_clean, test_size=0.3, random_state=42, stratify=y_clean
-        )
-        clean_acc = accuracy_score(y_test_clean, clf.predict(X_test_clean))
-        
-        results.append({
-            'Dataset': dataset_name,
-            'Method': method,
-            'Rate': rate,
-            'ASR': attack_success,
-            'Clean Test Accuracy': clean_acc
-        })
+            # WE SAVE THESE TARGET INDICES FOR EVALUATION
+            target_idx_1 = idx_1[torch.randperm(len(idx_1))[:n_targets_1]]
+            target_idx_0 = idx_0[torch.randperm(len(idx_0))[:n_targets_0]]
             
+            chunks_0 = torch.tensor_split(base_idx_0, n_targets_1)
+            chunks_1 = torch.tensor_split(base_idx_1, n_targets_0)
+            
+            X_final_images = X_images_clean.clone()
+
+            # 3. Apply Poisoning
+            if method == "poison_frogs":
+                for i, chunk in enumerate(chunks_0):
+                    if len(chunk) == 0: continue
+                    b_images = X_images_clean[chunk].to(device)
+                    t_image = X_images_clean[target_idx_1[i]].to(device)
+                    for j in range(0, len(b_images), 128):
+                        batch_poisoned = poison_frogs_optimize(latent_extractor, b_images[j:j+128], t_image)
+                        X_final_images[chunk[j:j+128]] = batch_poisoned.cpu()
+                        
+                for i, chunk in enumerate(chunks_1):
+                    if len(chunk) == 0: continue
+                    b_images = X_images_clean[chunk].to(device)
+                    t_image = X_images_clean[target_idx_0[i]].to(device)
+                    for j in range(0, len(b_images), 128):
+                        batch_poisoned = poison_frogs_optimize(latent_extractor, b_images[j:j+128], t_image)
+                        X_final_images[chunk[j:j+128]] = batch_poisoned.cpu()
+                        
+            elif method == "witches_brew":
+                for i, chunk in enumerate(chunks_0):
+                    if len(chunk) == 0: continue
+                    p_images = witches_brew_optimize(
+                        victim_model, X_images_clean[chunk], y_labels_clean[chunk], 
+                        X_images_clean[target_idx_1[i]], torch.tensor(0)
+                    )
+                    X_final_images[chunk] = p_images.cpu()
+                    
+                for i, chunk in enumerate(chunks_1):
+                    if len(chunk) == 0: continue
+                    p_images = witches_brew_optimize(
+                        victim_model, X_images_clean[chunk], y_labels_clean[chunk], 
+                        X_images_clean[target_idx_0[i]], torch.tensor(1)
+                    )
+                    X_final_images[chunk] = p_images.cpu()
+
+            # 4. Extract Latents for Training Victim Model
+            latent_vectors = []
+            with torch.no_grad():
+                for i in range(0, len(X_final_images), 128):
+                    batch = X_final_images[i:i+128].to(device)
+                    latent_vectors.append(latent_extractor(batch).squeeze().cpu())
+            X_train = torch.cat(latent_vectors).numpy()
+            y_train = y_labels_clean.numpy()
+
+            # 5. Train Unregularized Linear Victim
+            clf = LogisticRegression(penalty=None, solver='lbfgs', max_iter=3000, random_state=42)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=ConvergenceWarning)
+                clf.fit(X_train, y_train)
+
+            # 6. EVALUATE TARGETS DIRECTLY
+            with torch.no_grad():
+                # Extract latents of the actual clean targets we selected
+                t1_latents = latent_extractor(X_images_clean[target_idx_1].to(device)).squeeze().cpu().numpy()
+                t0_latents = latent_extractor(X_images_clean[target_idx_0].to(device)).squeeze().cpu().numpy()
+                
+                # Reshape if only 1 target
+                if len(t1_latents.shape) == 1: t1_latents = t1_latents.reshape(1, -1)
+                if len(t0_latents.shape) == 1: t0_latents = t0_latents.reshape(1, -1)
+
+            # A success means the target was forced into the OPPOSITE class
+            pred_t1 = clf.predict(t1_latents)
+            pred_t0 = clf.predict(t0_latents)
+            
+            asr_1 = np.mean(pred_t1 == 0) * 100 # Class 1 targeted by Class 0
+            asr_0 = np.mean(pred_t0 == 1) * 100 # Class 0 targeted by Class 1
+            
+            results.append({
+                'Method': method, 'Rate': rate, 
+                'Targeted_ASR_Class_1': asr_1, 'Targeted_ASR_Class_0': asr_0,
+                'Total_Targets': len(target_idx_1) + len(target_idx_0)
+            })
+
+    # =========================================================
+    # Plotting
+    # =========================================================
     results_df = pd.DataFrame(results)
     
-    if results_df.empty:
-        print("No valid data found to plot. Check your CSV paths.")
-        return
-        
-    # Aggregate results
-    agg_df = results_df.groupby(['Method', 'Rate']).agg(
-        Mean_ASR=('ASR', lambda x: np.mean(x) * 100), 
-        Mean_Clean_Acc=('Clean Test Accuracy', lambda x: np.mean(x) * 100)
-    ).reset_index()
-    
-    # --- Plotting ---
     sns.set_theme(style="whitegrid")
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
     
-    # Plot 1: Attack Success Rate (ASR)
-    sns.lineplot(
-        data=agg_df, x='Rate', y='Mean_ASR', hue='Method', 
-        marker='o', linewidth=3, markersize=10, ax=ax1
-    )
-    ax1.set_title("Attack Success Rate (MLP Target Model)", fontsize=14, fontweight='bold')
+    sns.lineplot(data=results_df, x='Rate', y='Targeted_ASR_Class_1', hue='Method', marker='o', linewidth=3, ax=ax1)
+    ax1.set_title("Targeted ASR: Specific Class 1 Images predicted as 0", fontsize=14, fontweight='bold')
     ax1.set_xlabel("Poisoning Rate", fontsize=12)
-    ax1.set_ylabel("ASR (%)", fontsize=12)
+    ax1.set_ylabel("Target Misclassification Rate (%)", fontsize=12)
     ax1.set_ylim(-5, 105)
     
-    # Plot 2: Clean Test Accuracy (Stealth)
-    sns.lineplot(
-        data=agg_df, x='Rate', y='Mean_Clean_Acc', hue='Method', 
-        marker='s', linewidth=2, linestyle='--', ax=ax2
-    )
-    ax2.set_title("MLP Overall Accuracy (Stealth)", fontsize=14, fontweight='bold')
+    sns.lineplot(data=results_df, x='Rate', y='Targeted_ASR_Class_0', hue='Method', marker='s', linewidth=3, ax=ax2)
+    ax2.set_title("Targeted ASR: Specific Class 0 Images predicted as 1", fontsize=14, fontweight='bold')
     ax2.set_xlabel("Poisoning Rate", fontsize=12)
-    ax2.set_ylabel("Overall Accuracy (%)", fontsize=12)
-    ax2.set_ylim(85, 100) 
+    ax2.set_ylabel("Target Misclassification Rate (%)", fontsize=12)
+    ax2.set_ylim(-5, 105) 
     
     plt.tight_layout()
-    save_path = "attack_asr_mlp_evaluation.png"
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"\n✅ Evaluation complete. Plot saved to {save_path}")
+    plt.savefig("targeted_attack_verification.png", dpi=300, bbox_inches='tight')
+    print("\n✅ Verification complete! Saved plot to targeted_attack_verification.png")
 
 if __name__ == "__main__":
-    evaluate_attack_success_rate_mlp(meta_db_path="data/meta_db_image.csv")
+    # You might need to change this path to match an actual file in your directory
+    verify_targeted_attacks()

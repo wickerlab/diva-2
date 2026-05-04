@@ -145,7 +145,12 @@ def fetch_and_binarize_images(sources, n_max, base_folder="data", db_path=None):
                 X_pair, y_pair = X_all[mask], y_all[mask]
                 
                 y_pair = torch.where(y_pair == c0, torch.tensor(0), torch.tensor(1))
-                indices = torch.randperm(len(y_pair))[:2000]
+
+                # Random subsampling to have randomly sized datasets
+                max_n = min(len(y_pair), 5000)
+                n_subsampling = torch.randint(low=max_n // 4, high=max_n, size=(1,)).item()
+
+                indices = torch.randperm(len(y_pair))[:n_subsampling]
                 torch.save({"X": X_pair[indices], "y": y_pair[indices]}, pt_file_path)
 
             if not os.path.exists(csv_file_path):

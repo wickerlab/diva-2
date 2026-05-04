@@ -7,19 +7,22 @@ from pathlib import Path
 
 from scripts.base_poisoner import BasePoisoner
 from scripts.utils.utils import to_csv
-from .utils.feature_collision import poison_frogs_optimize
+from .utils.bilevel_optimization import metapoison_optimize
 
-class PoisonFrogsPoisoner(BasePoisoner):
+class MetaPoisonPoisoner(BasePoisoner):
+    """
+    Implements a First-Order approximation of Clean-Label MetaPoison.
+    Reference: Huang et al. (2020). MetaPoison: Practical General-purpose Clean-label Data Poisoning.
+    """
     def __init__(self, base_folder):
-        super().__init__(name="poison_frogs", base_folder=base_folder)
+        super().__init__(name="metapoison", base_folder=base_folder)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Load the Latent Extractor
+        # Load the ResNet18 Latent Extractor
         self.resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT).to(self.device)
         self.latent_extractor = torch.nn.Sequential(*(list(self.resnet.children())[:-1])).eval()
 
     def apply_poisoning(self, file_path, advx_range):
-        # Swap the clean.csv path back to the raw .pt PyTorch tensors
         pt_file_path = file_path.replace("clean_data", "raw_images").replace("_clean.csv", ".pt")
         data = torch.load(pt_file_path)
         
@@ -33,9 +36,8 @@ class PoisonFrogsPoisoner(BasePoisoner):
         
         metadata_list = []
 
-        for i in advx_range:
-            rate = i/2
-            path_poison_data = f'{path_output_base}_poison_frogs_{rate:.2f}.csv'
+        for rate in advx_range:
+            path_poison_data = f'{path_output_base}_metapoison_{rate:.2f}.csv'
             
             if os.path.exists(path_poison_data):
                 self.logger.info(f'     Rate {rate:.2f}: Already generated. Skipping.')
@@ -45,60 +47,56 @@ class PoisonFrogsPoisoner(BasePoisoner):
             n_poison = int(len(X_images) * rate)
 
             if n_poison == 0:
-                X_final_images = X_images
-                y_final = y_labels
+                X_final_images = X_images.clone()
+                y_final = y_labels.clone()
             else:
-                self.logger.info(f'     Generating {rate * 100:.0f}% poison via Poison Frogs Feature Collision...')
+                self.logger.info(f'     Generating {rate * 100:.0f}% poison via Symmetric Bi-Level MetaPoison...')
                 
-                # 1. Split budget & calculate targets using the Square Root rule
+                # 1. Split budget & calculate targets (Square Root Rule)
                 n_poison_0 = n_poison // 2
                 n_poison_1 = n_poison - n_poison_0
                 
                 n_targets_1 = max(1, int(np.ceil(np.sqrt(n_poison_0)))) # Class 0 attacks Class 1
                 n_targets_0 = max(1, int(np.ceil(np.sqrt(n_poison_1)))) # Class 1 attacks Class 0
                 
-                # 2. Select base images to be corrupted
+                # 2. Select base and target images
                 base_idx_0 = idx_0[torch.randperm(len(idx_0))[:n_poison_0]]
                 base_idx_1 = idx_1[torch.randperm(len(idx_1))[:n_poison_1]]
                 
-                # 3. Select target images
                 target_idx_1 = idx_1[torch.randperm(len(idx_1))[:n_targets_1]]
                 target_idx_0 = idx_0[torch.randperm(len(idx_0))[:n_targets_0]]
                 
-                # 4. Chunk the base indices so each chunk assigns to one target
                 chunks_0 = torch.tensor_split(base_idx_0, n_targets_1)
                 chunks_1 = torch.tensor_split(base_idx_1, n_targets_0)
                 
                 X_final_images = X_images.clone()
-                
+
                 # --- EXECUTE: Class 0 attacking Class 1 ---
                 for i, chunk in enumerate(chunks_0):
                     if len(chunk) == 0: continue
                     b_images = X_images[chunk].to(self.device)
+                    b_labels = y_labels[chunk].to(self.device)
                     t_image = X_images[target_idx_1[i]].to(self.device)
                     
-                    # Batch execution inside chunk for VRAM safety
-                    for j in range(0, len(b_images), 128):
-                        batch_base = b_images[j:j+128]
-                        batch_poisoned = poison_frogs_optimize(self.latent_extractor, batch_base, t_image)
-                        X_final_images[chunk[j:j+128]] = batch_poisoned.cpu()
-                        
+                    # We want the Class 1 Target to be misclassified as Class 0
+                    p_images = metapoison_optimize(self.latent_extractor, b_images, b_labels, t_image, target_label_intended=0, device=self.device)
+                    X_final_images[chunk] = p_images.cpu()
+                    
                 # --- EXECUTE: Class 1 attacking Class 0 ---
                 for i, chunk in enumerate(chunks_1):
                     if len(chunk) == 0: continue
                     b_images = X_images[chunk].to(self.device)
+                    b_labels = y_labels[chunk].to(self.device)
                     t_image = X_images[target_idx_0[i]].to(self.device)
                     
-                    # Batch execution inside chunk for VRAM safety
-                    for j in range(0, len(b_images), 128):
-                        batch_base = b_images[j:j+128]
-                        batch_poisoned = poison_frogs_optimize(self.latent_extractor, batch_base, t_image)
-                        X_final_images[chunk[j:j+128]] = batch_poisoned.cpu()
+                    # We want the Class 0 Target to be misclassified as Class 1
+                    p_images = metapoison_optimize(self.latent_extractor, b_images, b_labels, t_image, target_label_intended=1, device=self.device)
+                    X_final_images[chunk] = p_images.cpu()
                 
                 y_final = y_labels.clone()
 
             # --- LATENT CONVERSION ---
-            self.logger.info(f"     Extracting Latent features for rate {rate:.2f}...")
+            self.logger.info(f"     Extracting Latent features for MetaPoison rate {rate:.2f}...")
             latent_vectors = []
             
             with torch.no_grad():
