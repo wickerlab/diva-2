@@ -6,6 +6,8 @@ import time
 
 import numpy as np
 import pandas as pd
+import random
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -103,3 +105,28 @@ def open_json(path):
             return data_json
     except:
         print(f'Cannot open {path}')
+
+def set_global_seed(seed: int = 42):
+    """
+    Locks down all sources of randomness for complete reproducibility.
+    """
+    # 1. Python built-in random module
+    random.seed(seed)
+    
+    # 2. Numpy random state
+    np.random.seed(seed)
+    
+    # 3. PyTorch random state (CPU and GPU)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed) # For multi-GPU
+        
+    # 4. CuDNN Determinism (Forces PyTorch to use deterministic algorithms)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # 5. OS-level hash seed (for dictionary/set ordering)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    print(f"🌱 Global seed locked to: {seed}")

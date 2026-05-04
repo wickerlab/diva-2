@@ -7,12 +7,7 @@ import logging
 import joblib
 import glob
 from pathlib import Path
-import openml
 import aim
-import matplotlib.pyplot as plt
-import seaborn as sns
-import time
-import hashlib
 from enum import Enum
 import tqdm
 
@@ -21,16 +16,14 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import ParameterGrid
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import GroupShuffleSplit
-from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, confusion_matrix
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score
 from xgboost import XGBClassifier
-import scipy.sparse as sp
-from sklearn.decomposition import TruncatedSVD
-from sklearn.utils import resample
 
 # --- Modular Pipeline Imports ---
 from scripts.cmeasures import compute_cmeasures
 from scripts.meta_db import append_to_db
 from scripts.utils.plots import *
+from scripts.utils.utils import set_global_seed
 
 # --- Import your Specific Poisoners ---
 from scripts.svm_poissvm.svm_poissvm_generate_metadb import PoisSVMPoisoner
@@ -75,7 +68,13 @@ MODALITY_CONFIG = {
         "db_path": "data/meta_db_image.csv",
         "model_path": "data/meta_classifier_image.joblib",
         "valid_sources": ["svhn", "mnist", "fashion_mnist", None],
-        "valid_poisoners": ["witches_brew", "poison_frogs", "random_flip_svm", "afla_svm", "badnets", "autoencoder"] 
+        "valid_poisoners": [
+            "witches_brew",
+            "poison_frogs",
+            "random_flip_svm",
+            "badnets",
+            "autoencoder"
+        ] 
     },
     TaskModality.IMAGE_MULTICLASS: {
         "db_path": "data/meta_db_image_multi.csv",
@@ -350,11 +349,14 @@ if __name__ == "__main__":
     parser.add_argument("--description", type=str, default="Meta-Learner Training Run", help="Aim run description")
     parser.add_argument("--n_attacks", type=int, default=4, help="Number of attacks per clean dataset")
     parser.add_argument("--methods", nargs='+', type=str, default=None, help="Filter by methods")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     
     # --- Path Overrides (Optional) ---
     parser.add_argument("--db_path", type=str, default=None, help="Override path to master DB")
     parser.add_argument("--model_path", type=str, default=None, help="Override path to save models")
     args = parser.parse_args()
+
+    set_global_seed(args.seed)
 
     # 1. Load Modality Config
     config = MODALITY_CONFIG[TaskModality(args.modality)]
