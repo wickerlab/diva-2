@@ -1,4 +1,6 @@
 import os
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["DATASETS_VERBOSITY"] = "error"
 import argparse
 import random
 import numpy as np
@@ -23,7 +25,7 @@ from xgboost import XGBClassifier
 from scripts.cmeasures import compute_cmeasures
 from scripts.meta_db import append_to_db
 from scripts.utils.plots import *
-from scripts.utils.utils import set_global_seed, BackgroundPrefetcher
+from scripts.utils.utils import set_global_seed
 
 # --- Import your Specific Poisoners ---
 from scripts.svm_poissvm.svm_poissvm_generate_metadb import PoisSVMPoisoner
@@ -76,7 +78,7 @@ MODALITY_CONFIG = {
             "random_flip_svm",
             "badnets",
             "autoencoder",
-            "metapoison"
+            #"metapoison"
         ] 
     },
     TaskModality.IMAGE_MULTICLASS: {
@@ -163,14 +165,13 @@ def augment_training_db(config, base_folder, n_datasets, n_attacks, workers, sou
             new_clean_files = generate_synthetic_data(n_datasets, base_folder)
             
     elif config == MODALITY_CONFIG[TaskModality.IMAGE_BINARY]:
-        raw_generator = fetch_and_binarize_images(
+        new_clean_files = fetch_and_binarize_images(
             sources=source, 
             n_max=n_datasets, 
             base_folder=base_folder, 
             db_path=db_path,
             max_pair=max_pair
         )
-        new_clean_files = BackgroundPrefetcher(raw_generator, max_prefetch=2*max_pair-1)
 
     advx_range = np.round(np.arange(0.05, 0.31, 0.05), 2)
     #advx_range = [0.01, 0.03, 0.05, 0.08, 0.10]

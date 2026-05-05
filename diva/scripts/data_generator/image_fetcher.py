@@ -14,6 +14,8 @@ from datasets import load_dataset, Image
 
 # Import the builder function from your new script
 from scripts.data_generator.hf_dataset_scraper import build_hf_dataset_csv
+import os
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 logger = logging.getLogger("ImageFetcher")
 
