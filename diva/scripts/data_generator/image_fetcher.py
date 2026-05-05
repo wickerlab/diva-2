@@ -9,24 +9,37 @@ import random
 import shutil
 
 # Hugging Face Imports
-from huggingface_hub import HfApi
-from datasets import load_dataset, load_dataset_builder, Image, disable_progress_bar
+import datasets
+from datasets import load_dataset, Image
 
-disable_progress_bar()
+# Import the builder function from your new script
+from scripts.data_generator.hf_dataset_scraper import build_hf_dataset_csv
+
 logger = logging.getLogger("ImageFetcher")
 
-def get_dynamic_image_sources(n_sources):
-    logger.info(f"Querying Hugging Face API for top {n_sources} image classification datasets...")
-    api = HfApi()
-    datasets = api.list_datasets(
-        filter="task_categories:image-classification", 
-        sort="downloads",
-        limit=n_sources * 3
-    )
-    return [d.id for d in datasets]
+def get_preverified_image_sources(csv_path="data/hf_image_datasets.csv", max_size_gb=1.0):
+    """Reads the pre-sized dataset registry, filtering by max size."""
+    
+    # If the registry doesn't exist, build it automatically!
+    if not os.path.exists(csv_path):
+        logger.warning(f"Dataset registry {csv_path} not found. Building it now...")
+        build_hf_dataset_csv(n_sources=1000, output_csv=csv_path)
+        
+    df = pd.read_csv(csv_path)
+    
+    # Filter for datasets that are strictly under our size limit
+    safe_datasets = df[df["Size_GB"] <= max_size_gb].copy()
+    
+    # Sort by highest downloads
+    safe_datasets.sort_values(by="Downloads", ascending=False, inplace=True)
+    
+    logger.info(f"Loaded {len(safe_datasets)} pre-verified datasets under {max_size_gb}GB.")
+    return safe_datasets["Dataset"].tolist()
 
-def fetch_and_binarize_images(sources, n_max, base_folder="data", db_path=None, max_pair= 10):
-    logger.info("Fetching Datasets (Streaming Mode)...")
+def fetch_and_binarize_images(sources, n_max, base_folder="data", db_path=None, max_pair=10):
+    datasets.disable_progress_bar()
+    logger.info("Fetching Datasets (Streaming Mode from CSV Registry)...")
+    
     image_dir = os.path.join(base_folder, "raw_images")
     clean_dir = os.path.join(base_folder, "clean_data")
     os.makedirs(image_dir, exist_ok=True)
@@ -39,8 +52,13 @@ def fetch_and_binarize_images(sources, n_max, base_folder="data", db_path=None, 
             processed_datanames = set(df['Data'].values)
         except Exception: pass
 
+    # --- USE THE NEW REGISTRY SYSTEM ---
+    MAX_DOWNLOAD_SIZE_GB = 1.0
     if not sources:
-        sources = get_dynamic_image_sources(n_sources=n_max)
+        sources = get_preverified_image_sources(
+            csv_path=os.path.join(base_folder, "hf_image_datasets.csv"), 
+            max_size_gb=MAX_DOWNLOAD_SIZE_GB
+        )
 
     transform = transforms.Compose([
         transforms.Lambda(lambda img: img.convert("RGB")),
@@ -55,7 +73,6 @@ def fetch_and_binarize_images(sources, n_max, base_folder="data", db_path=None, 
 
     count_selected = 0
     MAX_PAIRS_PER_SOURCE = max_pair
-    MAX_DOWNLOAD_SIZE_GB = 1.5
     MAX_POINTS_NEEDED = 5000
 
     for src in sources:
@@ -66,29 +83,14 @@ def fetch_and_binarize_images(sources, n_max, base_folder="data", db_path=None, 
         
         existing_count = sum(1 for d in processed_datanames if d.startswith(f"hf_{safe_name}_"))
         if existing_count >= MAX_PAIRS_PER_SOURCE:
-            logger.info(f"[{src}] Already has {existing_count} processed pairs. Skipping completely.")
             continue
-
-        try:
-            builder = load_dataset_builder(src)
-            dl_size = builder.info.download_size or 0
-            ds_size = builder.info.dataset_size or 0
-            total_size_gb = (dl_size + ds_size) / (1024 * 1024 * 1024)
             
-            if total_size_gb > MAX_DOWNLOAD_SIZE_GB:
-                logger.warning(f"[{src}] Dataset too large (~{total_size_gb:.2f}GB). Skipping.")
-                continue
-            elif total_size_gb == 0:
-                logger.warning(f"[{src}] Dataset size is unknown (missing metadata). Skipping to prevent massive blind downloads.")
-                continue
-            logger.info(f"Estimated size for {src}: {total_size_gb:.3f}GB")
-        except Exception as e:
-            continue
-        
         temp_cache_dir = os.path.join(base_folder, "temp_hf_cache", safe_name)
         
         try:
-            # Download to temp directory
+            # We no longer need load_dataset_builder here! 
+            # If it made it into 'sources', we already know its exact size.
+            logger.info(f"Downloading pre-verified dataset: {src}")
             dataset = load_dataset(src, split="train", streaming=False, cache_dir=temp_cache_dir)
             
             image_col = next((col for col, f in dataset.features.items() if isinstance(f, Image)), None)
@@ -174,9 +176,7 @@ def fetch_and_binarize_images(sources, n_max, base_folder="data", db_path=None, 
             continue
             
         finally:
-            # --- CACHE CLEANUP ---
             if 'dataset' in locals():
                 del dataset 
             if os.path.exists(temp_cache_dir):
                 shutil.rmtree(temp_cache_dir)
-                logger.info(f"    [Disk Management] Cleared temporary cache for {src}")

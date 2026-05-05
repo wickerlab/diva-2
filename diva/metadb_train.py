@@ -71,11 +71,11 @@ MODALITY_CONFIG = {
         "model_path": "data/meta_classifier_image.joblib",
         "valid_sources": ["svhn", "mnist", "fashion_mnist", None],
         "valid_poisoners": [
-            #"witches_brew",
-            #"poison_frogs",
-            #"random_flip_svm",
-            #"badnets",
-            #"autoencoder",
+            "witches_brew",
+            "poison_frogs",
+            "random_flip_svm",
+            "badnets",
+            "autoencoder",
             "metapoison"
         ] 
     },
