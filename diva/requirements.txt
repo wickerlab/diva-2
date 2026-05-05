@@ -1,3 +1,4 @@
+python-dotenv==1.0.0
 absl-py==2.1.0
 adversarial-robustness-toolbox==1.18.1
 aim==3.29.1
