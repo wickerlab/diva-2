@@ -16,8 +16,8 @@ import pandas as pd
 from pathlib import Path
 import concurrent.futures
 
-from ..utils.utils import open_csv, to_csv
-from ..base_poisoner import BasePoisoner
+from ...utils.utils import open_csv, to_csv
+from ...base_poisoner import BasePoisoner
 
 warnings.filterwarnings('ignore')
 

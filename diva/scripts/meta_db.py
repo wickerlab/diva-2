@@ -8,8 +8,8 @@ import logging
 import matplotlib.pyplot as plt
 import seaborn as sns
 from enum import Enum
-
-from scripts.cmeasures import compute_cmeasures
+import math
+from scripts.cmeasures import compute_cmeasures, add_new_measures_to_db
 
 # ==========================================
 # Task Modality Configuration
@@ -21,13 +21,13 @@ class TaskModality(str, Enum):
 
 MODALITY_CONFIG = {
     TaskModality.TABULAR_BINARY: {
-        "db_path": "data/meta_db_tabular.csv",
+        "db_path": "data/meta_db_universal.csv",
     },
     TaskModality.IMAGE_BINARY: {
-        "db_path": "data/meta_db_image.csv",
+        "db_path": "data/meta_db_universal.csv",
     },
     TaskModality.IMAGE_MULTICLASS: {
-        "db_path": "data/meta_db_image_multi.csv",
+        "db_path": "data/meta_db_universal.csv",
     }
 }
 
@@ -69,34 +69,49 @@ def sync_filesystem_to_metadb(db_path, folders_to_scan, workers=None):
     """
     Scans the provided folders for any clean or poisoned CSV datasets that are NOT 
     in the metadatabase. It extracts their metadata from the path, computes their 
-    C-Measures, and securely appends them to the DB.
+    C-Measures in batches, and progressively appends them to the DB.
     """
+    batch_size = workers*4
     existing_paths = set()
     if os.path.exists(db_path):
         try:
-            existing_paths = set(pd.read_csv(db_path, usecols=['Path'])['Path'].values)
+            # Normalize paths from DB to guarantee accurate matching (handles Windows \ vs Linux /)
+            db_paths = pd.read_csv(db_path, usecols=['Path'])['Path'].dropna().values
+            existing_paths = set(os.path.normpath(p) for p in db_paths)
         except Exception as e:
             logger.warning(f"Could not read existing DB paths: {e}")
 
+    # 1. Gather all CSVs
     all_csvs = []
     for folder in folders_to_scan:
         search_pattern = os.path.join(folder, "**", "*.csv")
         all_csvs.extend(glob.glob(search_pattern, recursive=True))
 
+    total_files_found = len(all_csvs)
+
+    # 2. Filter out files that are already in the DB
     files_to_process = []
     for f in all_csvs:
         f_norm = os.path.normpath(f)
         if any(skip in f_norm for skip in ["metadbs", "complexity_measures", "meta_database", "meta_db"]):
             continue
+        
+        # Verify and skip if already in the metadb
         if f_norm not in existing_paths:
             files_to_process.append(f_norm)
 
+    unprocessed_count = len(files_to_process)
+    
+    # --- Goal 3: Log total vs unprocessed ---
+    logger.info(f"Scanned folders and found {total_files_found} total CSV files.")
+    
     if not files_to_process:
         logger.info("No missing files found. The MetaDB is perfectly synced with the filesystem.")
         return
 
-    logger.info(f"Found {len(files_to_process)} unprocessed datasets on disk. Extracting metadata...")
+    logger.info(f"Found {unprocessed_count} unprocessed datasets on disk. Extracting metadata...")
 
+    # 3. Extract Metadata
     metadata_list = []
     for f in files_to_process:
         path_obj = Path(f)
@@ -140,11 +155,26 @@ def sync_filesystem_to_metadb(db_path, folders_to_scan, workers=None):
         logger.info("No valid metadata could be parsed from the missing files.")
         return
 
-    logger.info(f"Computing C-Measures for {len(metadata_list)} recovered files...")
-    paths_to_compute = [m["Path"] for m in metadata_list]
-    cmeasures_df = compute_cmeasures(paths_to_compute, workers=workers, db_path=db_path)
-    append_to_db(db_path, metadata_list, cmeasures_df)
-    logger.info("✅ Filesystem sync complete.")
+    # 4. Process progressively in Batches
+    logger.info(f"Computing C-Measures and syncing to DB in batches of {batch_size}...")
+    
+    total_batches = math.ceil(len(metadata_list) / batch_size)
+    
+    for i in range(0, len(metadata_list), batch_size):
+        current_batch_num = (i // batch_size) + 1
+        batch_meta = metadata_list[i : i + batch_size]
+        paths_to_compute = [m["Path"] for m in batch_meta]
+        
+        logger.info(f"Processing batch {current_batch_num}/{total_batches} ({len(batch_meta)} files)...")
+        
+        # Compute measures for this specific chunk
+        cmeasures_df = compute_cmeasures(paths_to_compute, workers=workers, db_path=db_path)
+        
+        # Append immediately to DB
+        if not cmeasures_df.empty:
+            append_to_db(db_path, batch_meta, cmeasures_df)
+            
+    logger.info("✅ Filesystem progressive sync complete.")
 
 
 def print_db_statistics(db_path):
@@ -242,22 +272,17 @@ if __name__ == "__main__":
         format='%(asctime)s [%(name)s] [%(levelname)s] %(message)s', 
         datefmt='%Y-%m-%d %H:%M:%S'
     )
-    logger = logging.getLogger("MetaDB")
-    if not logger.handlers:
-        ch = logging.StreamHandler()
-        ch.setFormatter(logging.Formatter('%(asctime)s [%(name)s] [%(levelname)s] %(message)s'))
-        logger.addHandler(ch)
 
     parser = argparse.ArgumentParser(description="Meta-Database Utility Toolkit")
-    parser.add_argument("action", choices=["sync", "stats"], help="Action to perform: 'sync' filesystem to DB, or get DB 'stats'")
+    parser.add_argument("action", choices=["sync", "stats", "add_measure"], help="Action to perform: 'sync' filesystem to DB, get DB 'stats', or 'add_measure' new PyMFE groups")
     
     # --- Modality and Overrides ---
     parser.add_argument("--modality", type=str, required=True, choices=[e.value for e in TaskModality], help="The core task modality to process.")
     parser.add_argument("--db_path", type=str, default=None, help="Override path to master DB")
     
-    # Args for sync
+    # Args for sync and extraction
     parser.add_argument("--folders", nargs='+', default=["data/clean_data", "data/poisoned_data"], help="Folders to scan for sync")
-    parser.add_argument("--workers", type=int, default=None, help="Number of PyMFE workers for sync")
+    parser.add_argument("--workers", type=int, default=None, help="Number of PyMFE workers")
 
     args = parser.parse_args()
 
@@ -269,3 +294,9 @@ if __name__ == "__main__":
         sync_filesystem_to_metadb(db_path, folders_to_scan=args.folders, workers=args.workers)
     elif args.action == "stats":
         print_db_statistics(db_path)
+    elif args.action == "add_measure":
+        add_new_measures_to_db(
+            db_path=db_path,
+            groups=["model-based", "landmarking"],
+            workers=args.workers
+        )

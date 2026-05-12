@@ -14,8 +14,8 @@ import logging
 from .utils.alfa_nn_v3 import get_dual_loss, solveLPNN
 from .utils.simple_nn_model import SimpleModel
 from .utils.torch_utils import train_model
-from ..utils.utils import open_csv, to_csv
-from ..base_poisoner import BasePoisoner
+from ...utils.utils import open_csv, to_csv
+from ...base_poisoner import BasePoisoner
 
 warnings.filterwarnings('ignore')
 

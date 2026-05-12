@@ -10,7 +10,7 @@ import warnings
 logger = logging.getLogger("CMeasures")
 
 def _extract_single(args):
-    file_path, features = args
+    file_path, features, groups = args
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -22,10 +22,10 @@ def _extract_single(args):
                 return None
             y = np.where(y == -1, 0, y)
             
-            if features is None:
-                mfe = MFE(groups=["complexity"], random_state=42)
-            else:
+            if features is not None:
                 mfe = MFE(features=features, random_state=42)
+            else:
+                mfe = MFE(groups=groups, random_state=42)
                 
             mfe.fit(X, y)
             f, v = mfe.extract()
@@ -44,7 +44,6 @@ def compute_cmeasures(file_paths, features=None, workers=None, db_path=None):
     """
     paths_to_process = file_paths
     
-    # Check the database and filter out paths that are already computed
     if db_path and os.path.exists(db_path):
         try:
             existing_db = pd.read_csv(db_path, usecols=['Path'])
@@ -59,12 +58,12 @@ def compute_cmeasures(file_paths, features=None, workers=None, db_path=None):
             
     if not paths_to_process:
         logger.info("All required C-Measures are already in the DB. Skipping extraction.")
-        return pd.DataFrame() # Return empty DataFrame so append_to_db knows to do nothing
+        return pd.DataFrame() 
 
     logger.info(f"Extracting C-Measures for {len(paths_to_process)} new files...")
     results = []
     
-    extraction_args = [(f, features) for f in paths_to_process]
+    extraction_args = [(f, features, ["complexity", "model-based", "landmarking"]) for f in paths_to_process]
     
     with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(_extract_single, arg): arg for arg in extraction_args}
@@ -79,3 +78,79 @@ def compute_cmeasures(file_paths, features=None, workers=None, db_path=None):
             if result is not None:
                 results.append(result)
     return pd.DataFrame(results)
+
+def add_new_measures_to_db(db_path, groups, workers=None):
+    """
+    Reads all paths from the existing DB, computes new PyMFE groups for them,
+    and merges the new columns into the DB safely in batches.
+    """
+    logger.info(f"Adding new PyMFE groups {groups} to {db_path}...")
+    
+    if not os.path.exists(db_path):
+        logger.error(f"Database {db_path} not found.")
+        return
+
+    df = pd.read_csv(db_path)
+    if 'Path' not in df.columns:
+        logger.error("The database does not contain a 'Path' column.")
+        return
+        
+    file_paths = df['Path'].dropna().unique().tolist()
+    
+    extraction_args = [(f, None, groups) for f in file_paths]
+    results = []
+    
+    # Calculate batch size dynamically based on workers
+    actual_workers = workers if workers is not None else (os.cpu_count() or 4)
+    batch_size = 3 * actual_workers
+    
+    # Set 'Path' as index so we can update specific rows easily
+    df.set_index('Path', inplace=True)
+    total_new_cols_added = set()
+
+    def save_batch(batch_results):
+        nonlocal df
+        if not batch_results:
+            return
+            
+        new_df = pd.DataFrame(batch_results)
+        # Drop duplicates and set index to match main df
+        new_df = new_df.drop_duplicates(subset=['Path'])
+        new_df.set_index('Path', inplace=True)
+        
+        # Identify completely new columns that aren't in the main DB yet
+        cols_to_add = new_df.columns.difference(df.columns).tolist()
+        if cols_to_add:
+            # Initialize new columns with None to avoid fragmentation
+            df[cols_to_add] = None 
+            total_new_cols_added.update(cols_to_add)
+            
+        # Elegantly overwrite/update the specific rows with the newly computed features
+        df.update(new_df)
+        
+        # Save back to CSV (resetting index puts 'Path' back as a normal column)
+        df.reset_index().to_csv(db_path, index=False)
+        logger.info(f"💾 Checkpoint saved: Processed and merged batch of {len(batch_results)} files.")
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_extract_single, arg): arg for arg in extraction_args}
+        pbar = tqdm(concurrent.futures.as_completed(futures), total=len(extraction_args), desc="New Measures")
+        
+        for future in pbar:
+            original_args = futures[future]
+            pbar.set_postfix(file=os.path.basename(original_args[0]))
+            
+            result = future.result()
+            if result is not None:
+                results.append(result)
+                
+            # Trigger intermediate save when buffer is full
+            if len(results) >= batch_size:
+                save_batch(results)
+                results = [] # Clear the buffer
+                
+    # Save any remaining results in the buffer
+    if results:
+        save_batch(results)
+        
+    logger.info(f"✅ Successfully computed {len(total_new_cols_added)} new features and completely updated {db_path}.")

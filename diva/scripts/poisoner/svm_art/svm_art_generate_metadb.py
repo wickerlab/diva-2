@@ -9,8 +9,8 @@ from art.estimators.classification import SklearnClassifier
 from art.attacks.poisoning import PoisoningAttackSVM
 from pathlib import Path
 
-from ..utils.utils import open_csv, to_csv
-from ..base_poisoner import BasePoisoner
+from ...utils.utils import open_csv, to_csv
+from ...base_poisoner import BasePoisoner
 
 warnings.filterwarnings('ignore')
 

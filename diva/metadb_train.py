@@ -1,6 +1,7 @@
 import os
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["DATASETS_VERBOSITY"] = "error"
+os.environ["HF_HUB_MAX_RETRIES"] = "0"
 import argparse
 import random
 import numpy as np
@@ -28,19 +29,19 @@ from scripts.utils.plots import *
 from scripts.utils.utils import set_global_seed
 
 # --- Import your Specific Poisoners ---
-from scripts.svm_poissvm.svm_poissvm_generate_metadb import PoisSVMPoisoner
-from scripts.svm_featurenoiseinjection.svm_featurenoiseinjection_generate_metadb import FeatureNoisePoisoner
-from scripts.svm_randomlabelflip.svm_randomlabelflip_generate_metadb import RandomFlipPoisoner
-from scripts.svm_alfa.svm_alfa_generate_metadb import AlfaPoisoner
-from scripts.svm_art.svm_art_generate_metadb import ArtSvmPoisoner
-from scripts.svm_biggio.svm_biggio_generate_metadb import BiggioSvmPoisoner
-from scripts.svm_feature_collision.svm_featurecollision import FeatureCollisionPoisoner
+from scripts.poisoner.svm_poissvm.svm_poissvm_generate_metadb import PoisSVMPoisoner
+from scripts.poisoner.svm_featurenoiseinjection.svm_featurenoiseinjection_generate_metadb import FeatureNoisePoisoner
+from scripts.poisoner.svm_randomlabelflip.svm_randomlabelflip_generate_metadb import RandomFlipPoisoner
+from scripts.poisoner.svm_alfa.svm_alfa_generate_metadb import AlfaPoisoner
+from scripts.poisoner.svm_art.svm_art_generate_metadb import ArtSvmPoisoner
+from scripts.poisoner.svm_biggio.svm_biggio_generate_metadb import BiggioSvmPoisoner
+from scripts.poisoner.svm_feature_collision.svm_featurecollision import FeatureCollisionPoisoner
 from scripts.witches_brew.witches_brew_generate_metadb import WitchesBrewPoisoner
-from scripts.poison_frogs.poison_frogs_generate_metadb import PoisonFrogsPoisoner
-from scripts.bullseye_polytope.bullseye_polytope_generate_metadb import BullseyePolytopePoisoner
-from scripts.badnets.badnet_generate_metadb import BadNetsPoisoner
-from scripts.learning_to_confuse.learning_to_confude_generate_metadb import AutoEncoderPoisoner
-from scripts.metapoison.metapoison_generate_metadb import MetaPoisonPoisoner
+from scripts.poisoner.poison_frogs.poison_frogs_generate_metadb import PoisonFrogsPoisoner
+from scripts.poisoner.bullseye_polytope.bullseye_polytope_generate_metadb import BullseyePolytopePoisoner
+from scripts.poisoner.badnets.badnet_generate_metadb import BadNetsPoisoner
+from scripts.poisoner.learning_to_confuse.learning_to_confude_generate_metadb import AutoEncoderPoisoner
+from scripts.poisoner.metapoison.metapoison_generate_metadb import MetaPoisonPoisoner
 from scripts.data_generator.image_fetcher import fetch_and_binarize_images
 from scripts.data_generator.openml_fetcher import fetch_openml_datasets
 
@@ -63,26 +64,27 @@ class TaskModality(str, Enum):
 
 MODALITY_CONFIG = {
     TaskModality.TABULAR_BINARY: {
-        "db_path": "data/meta_db_tabular.csv",
+        "db_path": "data/meta_db_universal.csv",
         "model_path": "data/meta_classifier_tabular.joblib",
         "valid_sources": ["synthetic", "openml", None],
         "valid_poisoners": ["alfa_svm", "feature_noise_svm", "random_flip_svm", "feature_collision", "biggio_svm"]
     },
     TaskModality.IMAGE_BINARY: {
-        "db_path": "data/meta_db_image.csv",
+        "db_path": "data/meta_db_universal.csv",
         "model_path": "data/meta_classifier_image.joblib",
         "valid_sources": ["svhn", "mnist", "fashion_mnist", None],
         "valid_poisoners": [
-            "witches_brew",
-            "poison_frogs",
-            "random_flip_svm",
+            #"witches_brew",
+            #"poison_frogs",
+            #"random_flip_svm",
+            #"alfa_svm",
             "badnets",
             "autoencoder",
-            #"metapoison"
+            "metapoison"
         ] 
     },
     TaskModality.IMAGE_MULTICLASS: {
-        "db_path": "data/meta_db_image_multi.csv",
+        "db_path": "data/meta_db_universal.csv",
         "model_path": "data/meta_classifier_image_multi.joblib",
         "valid_sources": ["cifar10", "cifar100", "svhn", None],
         "valid_poisoners": ["witches_brew", "poison_frogs", "bullseye_polytope"]

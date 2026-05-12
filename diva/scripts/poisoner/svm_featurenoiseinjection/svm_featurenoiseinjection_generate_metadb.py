@@ -6,8 +6,8 @@ import argparse
 from pathlib import Path
 import logging
 
-from ..utils.utils import open_csv, to_csv
-from ..base_poisoner import BasePoisoner
+from ...utils.utils import open_csv, to_csv
+from ...base_poisoner import BasePoisoner
 
 warnings.filterwarnings("ignore")
 
