@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 # Import your core optimization functions
 from scripts.witches_brew.utils.gradient_matching import witches_brew_optimize
-from scripts.poison_frogs.utils.feature_collision import poison_frogs_optimize
+from scripts.poisoner.poison_frogs.utils.feature_collision import poison_frogs_optimize
 
 def verify_targeted_attacks(clean_pt_path="data/raw_images/cifar10_1_vs_9.pt"):
     if not os.path.exists(clean_pt_path):

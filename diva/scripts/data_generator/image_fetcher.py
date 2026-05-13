@@ -1,46 +1,19 @@
 import os
 import torch
-import torchvision.transforms as transforms
 import torchvision.models as models
 import itertools
 import pandas as pd
 import logging
 import random
-import shutil
-
-# Hugging Face Imports
-import datasets
-from datasets import load_dataset, Image
-
-# Import the builder function from your new script
-from scripts.data_generator.hf_dataset_scraper import build_hf_dataset_csv
 import os
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 logger = logging.getLogger("ImageFetcher")
-
-def get_preverified_image_sources(csv_path="data/hf_image_datasets.csv", max_size_gb=1.0):
-    """Reads the pre-sized dataset registry, filtering by max size."""
-    
-    # If the registry doesn't exist, build it automatically!
-    if not os.path.exists(csv_path):
-        logger.warning(f"Dataset registry {csv_path} not found. Building it now...")
-        build_hf_dataset_csv(n_sources=1000, output_csv=csv_path)
-        
-    df = pd.read_csv(csv_path)
-    
-    # Filter for datasets that are strictly under our size limit
-    safe_datasets = df[df["Size_GB"] <= max_size_gb].copy()
-    
-    # Sort by highest downloads
-    safe_datasets.sort_values(by="Downloads", ascending=False, inplace=True)
-    
-    logger.info(f"Loaded {len(safe_datasets)} pre-verified datasets under {max_size_gb}GB.")
-    return safe_datasets["Dataset"].tolist()
+import glob
+import itertools
 
 def fetch_and_binarize_images(sources, n_max, base_folder="data", db_path=None, max_pair=10):
-    datasets.disable_progress_bar()
-    logger.info("Fetching Datasets (Streaming Mode from CSV Registry)...")
+    logger.info("Fetching Datasets from Local Raw Downloads...")
     
     image_dir = os.path.join(base_folder, "raw_images")
     clean_dir = os.path.join(base_folder, "clean_data")
@@ -54,21 +27,7 @@ def fetch_and_binarize_images(sources, n_max, base_folder="data", db_path=None, 
             processed_datanames = set(df['Data'].values)
         except Exception: pass
 
-    # --- USE THE NEW REGISTRY SYSTEM ---
-    MAX_DOWNLOAD_SIZE_GB = 1.0
-    if not sources:
-        sources = get_preverified_image_sources(
-            csv_path=os.path.join(base_folder, "hf_image_datasets.csv"), 
-            max_size_gb=MAX_DOWNLOAD_SIZE_GB
-        )
-
-    transform = transforms.Compose([
-        transforms.Lambda(lambda img: img.convert("RGB")),
-        transforms.Resize((32, 32)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-    ])
-
+    # Setup feature extractor
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT).to(device)
     latent_extractor = torch.nn.Sequential(*(list(resnet.children())[:-1])).eval()
@@ -77,36 +36,35 @@ def fetch_and_binarize_images(sources, n_max, base_folder="data", db_path=None, 
     MAX_PAIRS_PER_SOURCE = max_pair
     MAX_POINTS_NEEDED = 5000
 
-    for src in sources:
+    # Scan for locally downloaded raw pt files
+    downloaded_files = glob.glob(os.path.join(image_dir, "*_full.pt"))
+
+    for full_pt_path in downloaded_files:
         if count_selected >= n_max:
             break
             
-        safe_name = src.replace("/", "_").lower()
+        safe_name = os.path.basename(full_pt_path).replace("hf_", "").replace("_full.pt", "")
         
-        existing_count = sum(1 for d in processed_datanames if d.startswith(f"hf_{safe_name}_"))
-        if existing_count >= MAX_PAIRS_PER_SOURCE:
+        # Check if we've already maxed out pairs for this source
+        existing_count = sum(1 for d in processed_datanames if d.startswith(f"hf_{safe_name}_") or d.startswith(f"{safe_name}_"))
+        if existing_count > 0:
+            logger.info(f"Dataset '{safe_name}' already present in MetaDB. Skipping local load.")
             continue
             
-        temp_cache_dir = os.path.join(base_folder, "temp_hf_cache", safe_name)
-        
         try:
-            # We no longer need load_dataset_builder here! 
-            # If it made it into 'sources', we already know its exact size.
-            logger.info(f"Downloading pre-verified dataset: {src}")
-            dataset = load_dataset(src, split="train", streaming=False, cache_dir=temp_cache_dir)
+            logger.info(f"Processing local dataset: {safe_name}")
             
-            image_col = next((col for col, f in dataset.features.items() if isinstance(f, Image)), None)
-            label_col = next((col for col in dataset.features.keys() if 'label' in col.lower() or 'class' in col.lower()), None)
+            # Load pre-downloaded massive dataset
+            full_data = torch.load(full_pt_path)
+            X_all, y_all = full_data["X"], full_data["y"]
             
-            if not image_col or not label_col:
-                continue
-                
-            unique_classes = set(dataset[label_col])
+            unique_classes = torch.unique(y_all).tolist()
             if len(unique_classes) < 2: continue
 
             valid_pairs = []
-            all_combinations = list(itertools.combinations(list(unique_classes), 2))
+            all_combinations = list(itertools.combinations(unique_classes, 2))
             
+            # Find all combinations not yet in the DB
             for c0, c1 in all_combinations:
                 dataname = f"hf_{safe_name}_{c0}_vs_{c1}"
                 if dataname not in processed_datanames:
@@ -124,35 +82,30 @@ def fetch_and_binarize_images(sources, n_max, base_folder="data", db_path=None, 
                 csv_file_path = os.path.join(clean_dir, f"{dataname}_clean.csv")
                 
                 if not os.path.exists(pt_file_path):
-                    filtered_ds = dataset.filter(lambda x: x[label_col] in [c0, c1])
-                    if len(filtered_ds) < 100: continue
+                    # Filter for only the two target classes natively using PyTorch
+                    mask = (y_all == c0) | (y_all == c1)
+                    X_filtered = X_all[mask]
+                    y_filtered = y_all[mask]
                     
-                    if len(filtered_ds) > MAX_POINTS_NEEDED:
-                        sub_indices = random.sample(range(len(filtered_ds)), MAX_POINTS_NEEDED)
-                        filtered_ds = filtered_ds.select(sub_indices)
-                        
-                    X_tensors = []
-                    y_tensors = []
+                    if len(y_filtered) < 100: continue
                     
-                    for item in filtered_ds:
-                        try:
-                            img_tensor = transform(item[image_col])
-                            X_tensors.append(img_tensor)
-                            y_val = 0 if item[label_col] == c0 else 1
-                            y_tensors.append(torch.tensor(y_val))
-                        except Exception: pass
-                            
-                    if len(X_tensors) < 100: continue
+                    # Subsample if too large
+                    if len(y_filtered) > MAX_POINTS_NEEDED:
+                        indices = torch.randperm(len(y_filtered))[:MAX_POINTS_NEEDED]
+                        X_filtered = X_filtered[indices]
+                        y_filtered = y_filtered[indices]
                         
-                    X_pair = torch.stack(X_tensors)
-                    y_pair = torch.stack(y_tensors)
-
-                    max_n = min(len(y_pair), MAX_POINTS_NEEDED)
+                    # Strict Binarization (0 for class c0, 1 for class c1)
+                    y_bin = torch.where(y_filtered == c0, torch.tensor(0), torch.tensor(1))
+                    
+                    # Final subsample
+                    max_n = min(len(y_bin), MAX_POINTS_NEEDED)
                     n_subsampling = torch.randint(low=max_n // 4, high=max_n, size=(1,)).item()
-                    indices = torch.randperm(len(y_pair))[:n_subsampling]
+                    sub_indices = torch.randperm(len(y_bin))[:n_subsampling]
                     
-                    torch.save({"X": X_pair[indices], "y": y_pair[indices]}, pt_file_path)
+                    torch.save({"X": X_filtered[sub_indices], "y": y_bin[sub_indices]}, pt_file_path)
 
+                # Keep the same CSV saving approach
                 if not os.path.exists(csv_file_path):
                     data = torch.load(pt_file_path)
                     X_images, y_labels = data["X"], data["y"]
@@ -164,6 +117,11 @@ def fetch_and_binarize_images(sources, n_max, base_folder="data", db_path=None, 
                             latent_vectors.append(latent_extractor(batch).squeeze().cpu())
                             
                     X_tab = torch.cat(latent_vectors).numpy()
+                    
+                    # Flatten dimensions in case shape is [N, 512, 1, 1]
+                    if len(X_tab.shape) > 2:
+                        X_tab = X_tab.reshape(X_tab.shape[0], -1)
+                        
                     df = pd.DataFrame(X_tab, columns=[f"feature_{i}" for i in range(X_tab.shape[1])])
                     df['y'] = y_labels.numpy()
                     df.to_csv(csv_file_path, index=False)
@@ -171,14 +129,9 @@ def fetch_and_binarize_images(sources, n_max, base_folder="data", db_path=None, 
                 count_selected += 1
                 logger.info(f"    Prepared: {dataname} ({count_selected}/{n_max})")
                 
+                # Yield back to main.py orchestrator which automatically triggers poisoning & C-Measures
                 yield csv_file_path
 
         except Exception as e:
-            logger.warning(f"Failed to process dataset {src}: {e}")
+            logger.warning(f"Failed to process local file {full_pt_path}: {e}")
             continue
-            
-        finally:
-            if 'dataset' in locals():
-                del dataset 
-            if os.path.exists(temp_cache_dir):
-                shutil.rmtree(temp_cache_dir)

@@ -8,8 +8,8 @@ from pathlib import Path
 import logging
 from tqdm import tqdm
 
-from ..base_poisoner import BasePoisoner
-from ..utils.utils import open_csv, to_csv
+from ...base_poisoner import BasePoisoner
+from ...utils.utils import open_csv, to_csv
 
 RANDOM_SEED = 100
 MAX_ITERATIONS = 25

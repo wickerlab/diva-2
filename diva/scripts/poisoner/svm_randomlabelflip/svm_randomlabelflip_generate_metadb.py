@@ -1,54 +1,53 @@
 import os
-import time
 import warnings
 import numpy as np
 import pandas as pd
-from sklearn.svm import SVC
 import argparse
 from pathlib import Path
 import logging
 
-from .utils.alfa import alfa
-from ..utils.utils import open_csv, to_csv
-from ..base_poisoner import BasePoisoner
+from ...utils.utils import open_csv, to_csv
+from ...base_poisoner import BasePoisoner
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
-class AlfaPoisoner(BasePoisoner):
+class RandomFlipPoisoner(BasePoisoner):
     def __init__(self, base_folder):
-        super().__init__(name="alfa_svm", base_folder=base_folder)
+        super().__init__(name="random_flip_svm", base_folder=base_folder)
 
     def apply_poisoning(self, file_path, advx_range):
         X, y, cols = open_csv(file_path)
-        y = np.where(y == -1, 0, y)
         
         dataname = Path(file_path).stem
         path_output_base = os.path.join(self.poisoned_dir, dataname)
 
-        # Train a single, fast linear surrogate to guide ALFA
-        clf = SVC(kernel='linear')
-        clf.fit(X, y)
-
         path_poison_data_list = []
 
         for rate in advx_range:
-            path_poison_data = f'{path_output_base}_alfa_svm_{rate:.2f}.csv'
+            path_poison_data = f"{path_output_base}_randomlabelflip_svm_{rate:.2f}.csv"
             
             if os.path.exists(path_poison_data):
                 self.logger.info(f'     Rate {rate:.2f}: Already generated. Skipping.')
             else:
-                self.logger.info(f'     Generating {rate * 100:.0f}% poison data via ALFA...')
+                self.logger.info(f'     Generating {rate * 100:.0f}% poison data via Random Flip...')
                 if rate == 0:
                     to_csv(X, y, cols, path_poison_data)
-                else:
-                    # ALFA internally might expect -1/1, transforming temporarily just for the algo
-                    y_alfa = np.where(y == 0, -1, 1)
-                    y_flip = alfa(X, y_alfa, rate, svc_params=clf.get_params(), max_iter=20)
-                    y_flip = np.where(y_flip == -1, 0, 1)
-                    to_csv(X, y_flip, cols, path_poison_data)
-                    
+                    continue
+                # Ensure binary {0, 1}
+                y = np.where(y == -1, 0, y) 
+                y_flip = y.copy()
+                n_flip = int(len(y) * rate)
+                
+                if n_flip > 0:
+                    flip_indices = np.random.choice(len(y), size=n_flip, replace=False)
+                    # Flip 0 to 1 and 1 to 0
+                    y_flip[flip_indices] = 1 - y_flip[flip_indices]
+                
+                to_csv(X, y_flip, cols, path_poison_data)
+            
             path_poison_data_list.append(path_poison_data)
 
+        # Save purely the generation metadata
         metadata_list = []
         for p, r in zip(path_poison_data_list, advx_range):
             metadata_list.append({
