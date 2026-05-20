@@ -6,18 +6,11 @@ import logging
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.model_selection import GroupShuffleSplit
-from sklearn.metrics import accuracy_score, mean_absolute_error
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.decomposition import PCA
-from xgboost import XGBClassifier, XGBRegressor
+from sklearn.metrics import accuracy_score, mean_absolute_error, precision_recall_curve, roc_auc_score
+from xgboost import XGBRegressor, XGBClassifier
+from sklearn.preprocessing import LabelEncoder
 from pymfe.mfe import MFE
-from sklearn.svm import SVC
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from tabpfn import TabPFNClassifier
 
 # AIM Integration
 from aim import Run, Image
@@ -31,117 +24,24 @@ logging.basicConfig(
 logger = logging.getLogger("LOAO_Unified_Benchmark")
 
 # ==============================================================================
-# PyTorch Contrastive Components (From evaluate_contrastive.py)
-# ==============================================================================
-class TripletMetaDataset(Dataset):
-    """
-    Dynamically generates Triplets for Metric Learning GROUPED BY BASE DATASET:
-    Anchor: A Clean version of Dataset X
-    Positive: Another Clean version of Dataset X (with forced noise augmentation)
-    Negative: A Poisoned version of Dataset X
-    """
-    def __init__(self, X, y, groups, samples_per_epoch=3000, noise_std=0.02): # Slightly increased noise
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.int64)
-        self.groups = np.array(groups)
-        self.noise_std = noise_std
-        self.samples_per_epoch = samples_per_epoch
-
-        self.unique_groups = np.unique(self.groups)
-        self.group_to_clean = {}
-        self.group_to_poison = {}
-        
-        valid_groups = []
-        y_np = np.array(y) 
-        
-        for g in self.unique_groups:
-            idx_g = np.where(self.groups == g)[0]
-            
-            clean_idx = idx_g[y_np[idx_g] == 0]
-            poison_idx = idx_g[y_np[idx_g] == 1]
-            
-            if len(clean_idx) > 0 and len(poison_idx) > 0:
-                self.group_to_clean[g] = clean_idx
-                self.group_to_poison[g] = poison_idx
-                valid_groups.append(g)
-                
-        self.valid_groups = valid_groups
-        if not self.valid_groups:
-            raise ValueError("No valid groups found containing both clean and poisoned data!")
-
-    def __len__(self):
-        return self.samples_per_epoch
-
-    def __getitem__(self, idx):
-        # 1. Pick a random valid BaseGroup
-        g = np.random.choice(self.valid_groups)
-        
-        clean_idx = self.group_to_clean[g]
-        poison_idx = self.group_to_poison[g]
-
-        # 2. Anchor: Random clean sample from this group
-        a_idx = np.random.choice(clean_idx)
-        a = self.X[a_idx]
-
-        # 3. Positive: Another clean sample (or same if only 1 exists)
-        if len(clean_idx) > 1:
-            p_idx = np.random.choice(clean_idx)
-            p = self.X[p_idx]
-        else:
-            p = a
-
-        # 4. Negative: Random poison sample from the SAME group
-        n_idx = np.random.choice(poison_idx)
-        n = self.X[n_idx]
-
-        return a, p, n
-
-class MetricEmbeddingNet(nn.Module):
-    """
-    Maps C-Measures into an embedding space using L2 normalization.
-    """
-    def __init__(self, input_dim, embed_dim=32):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Linear(64, embed_dim)
-        )
-
-    def forward(self, x):
-        emb = self.net(x)
-        # L2 Normalize so embeddings live on a hypersphere
-        return F.normalize(emb, p=2, dim=1)
-
-# ==============================================================================
-# Helper Functions
+# Helper Functions (Refactored to Avoid Duplication)
 # ==============================================================================
 def extract_base_dataset_name(dataname):
-    """
-    Extracts the parent dataset name to prevent data leakage.
-    Example: 'hf_mnist_0_vs_1' -> 'hf_mnist'
-    """
     if "_vs_" in dataname:
         part1 = dataname.split("_vs_")[0]
         return part1.rsplit("_", 1)[0]
     return dataname
 
-
-# ==============================================================================
-# 1. Classification Benchmark (From evaluate.py)
-# ==============================================================================
-def run_classification_benchmark(db_path, aim_run, workers=4, seed=42, run_type="all_features"):
-    logger.info(f"--- Starting Classification LOAO Benchmark [{run_type.upper()}] ---")
-
-    plots_dir = f"data/plots_loao_benchmark_{run_type}"
-    os.makedirs(plots_dir, exist_ok=True)
-    
+def prepare_benchmark_data(db_path, run_type, seed, split_target='Is_Poisoned'):
+    """
+    Standardized data loading, filtering, and train-test splitting 
+    (mimicking the original classification benchmark approach).
+    """
     df = pd.read_csv(db_path)
     df['BaseGroup'] = df['Data'].apply(extract_base_dataset_name)
+
+    # feature_noise_svm is considered clean
+    df.loc[df['Method'].isin(['feature_noise_svm']), 'Is_Poisoned'] = 0
     
     drop_cols = ['Data', 'Path', 'Method', 'Rate', 'Is_Poisoned', 'error', 'BaseGroup']
     drop_cols += [c for c in df.columns if c in ['Train.Clean', 'Test.Clean', 'Train.Poison', 'Test.Poison']]
@@ -153,39 +53,101 @@ def run_classification_benchmark(db_path, aim_run, workers=4, seed=42, run_type=
         logger.info(f"Filtered down to {len(feature_cols)} complexity features.")
     else:
         logger.info(f"Using all {len(feature_cols)} available features.")
-    
-    # HARD OVERRIDE
-    top_features = [
-        'n4.sd', 'n4.mean', 'n2.sd', 'n2.mean', 'n1', 'n3.mean',
-        'var_importance.mean', 'var_importance.sd', 'linear_discr.sd', 'naive_bayes.sd', 
-        'tree_depth.mean', 't2', 't3', 't4', 'density', 'f3.mean', 'naive_bayes.mean', 'linear_discr.mean'
-    ]
-    feature_cols = [c for c in feature_cols if c in top_features]
-    plots_dir+="_filtered"
-    os.makedirs(plots_dir, exist_ok=True)
-    logger.info(f"⚠️ HARD OVERRIDE: Restricted to {len(feature_cols)} Top Features.")
 
     df[feature_cols] = df[feature_cols].fillna(0)
-    
-    poisoners = sorted([m for m in df['Method'].unique() if m != 'clean'])
-    all_methods = sorted(list(df['Method'].unique()))
-    logger.info(f"Identified {len(poisoners)} poisoners to test: {poisoners}")
-
-    alfa_df = df[df['Method'] == 'alfa_svm']
-    other_df = df[df['Method'] != 'alfa_svm']
-    
-    if len(alfa_df) > 0:
-        alfa_kept = alfa_df.sample(frac=0.5, random_state=42)
-        df = pd.concat([other_df, alfa_kept]).reset_index(drop=True)
 
     gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
-    train_idx, test_idx = next(gss.split(df[feature_cols], df['Is_Poisoned'], df['BaseGroup']))
+    train_idx, test_idx = next(gss.split(df[feature_cols], df[split_target], df['BaseGroup']))
     
     train_df_full = df.iloc[train_idx].copy()
     test_df = df.iloc[test_idx].copy()
+
+    # Leave out specific poisoners as defined in classification
+    poisoner_to_leave_out = ["diva_attack_xgb", "diva_attack", "diva_attack2"]
+    train_df_full = train_df_full[~(train_df_full['Method'].isin(poisoner_to_leave_out))]
+    test_df = test_df[~(test_df['Method'].isin(poisoner_to_leave_out))]
+
+    # Identify methods
+    poisoners = sorted([m for m in train_df_full['Method'].unique() if m != 'clean'])
+    all_methods = sorted(list(train_df_full['Method'].unique()))
+    
+    logger.info(f"Identified {len(poisoners)} poisoners to test: {poisoners}")
+    
+    return train_df_full, test_df, feature_cols, poisoners, all_methods
+
+def plot_target_centric(loao_results, loao_global_results, all_methods, poisoners, metric_name, plots_dir, task_name, run_type, aim_run, y_limit=1.1):
+    """
+    Standardized target-centric grid plotting (used across Classification, Regression, Contrastive).
+    Visually separates benign methods (clean, feature_noise_svm) from adversarial poisoners.
+    """
+    sns.set_theme(style="whitegrid")
+    cols = 3
+    rows2 = int(np.ceil(len(all_methods) / cols))
+    fig2, axes2 = plt.subplots(rows2, cols, figsize=(6 * cols, 5 * rows2), squeeze=False)
+    axes2 = axes2.flatten()
+    
+    benign_methods = ['clean', 'feature_noise_svm']
+
+    for idx, test_target in enumerate(all_methods):
+        ax = axes2[idx]
+        scores = [loao_results[omitted].get(test_target, 0) for omitted in poisoners]
+        
+        # Color logic: Green for benign targets, Blue/Red for adversarial targets
+        if test_target in benign_methods: 
+            colors = ['#2ecc71'] * len(poisoners)
+        else:
+            colors = ['#e74c3c' if omitted == test_target else '#3498db' for omitted in poisoners]
+
+        bars = ax.bar(poisoners, scores, color=colors, edgecolor='black', linewidth=0.5)
+
+        # Plot global performance overlay on benign plots
+        if test_target in benign_methods:
+            global_scores = [loao_global_results[omitted] for omitted in poisoners]
+            ax.plot(range(len(poisoners)), global_scores, color='darkorange', marker='o', 
+                    linestyle='-', linewidth=2, markersize=6, label=f'Global {metric_name}')
+            loc = 'lower left' if metric_name == 'Accuracy' else 'upper left'
+            ax.legend(loc=loc, fontsize=9)
+        
+        # Add (Benign) label to title if applicable
+        title_suffix = " (Benign)" if test_target in benign_methods else ""
+        ax.set_title(f"{metric_name} on '{test_target}'{title_suffix}", fontsize=12, fontweight='bold')
+        ax.set_ylim(0, y_limit)
+        ax.set_ylabel(f"Detection {metric_name}", fontsize=10)
+        ax.set_xlabel("Method Omitted During Training", fontsize=10)
+        ax.set_xticks(range(len(poisoners)))
+        ax.set_xticklabels(poisoners, rotation=45, ha='right', fontsize=9)
+        
+        for bar in bars:
+            yval = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2, yval + (y_limit * 0.02), f"{yval:.2f}", ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+    for idx in range(len(all_methods), len(axes2)): 
+        fig2.delaxes(axes2[idx])
+        
+    fig2.tight_layout()
+    target_plot_path = os.path.join(plots_dir, "loao_target_centric_grid.png")
+    fig2.savefig(target_plot_path, dpi=300, bbox_inches='tight')
+    aim_run.track(Image(fig2), name="target_centric", context={"task": task_name, "run_type": run_type})
+    plt.close(fig2)
+
+
+# ==============================================================================
+# 1. Classification Benchmark
+# ==============================================================================
+def run_classification_benchmark(db_path, aim_run, workers=4, seed=42, run_type="all_features"):
+    logger.info(f"--- Starting Classification LOAO Benchmark [{run_type.upper()}] ---")
+
+    plots_dir = f"data/plots_loao_benchmark_{run_type}"
+    os.makedirs(plots_dir, exist_ok=True)
+    
+    # Use centralized data preparation
+    train_df_full, test_df, feature_cols, poisoners, all_methods = prepare_benchmark_data(
+        db_path, run_type, seed, split_target='Is_Poisoned'
+    )
+    # Re-append 'None' specific to classification setup (this trains on ALL data)
+    poisoners.append("None")
     
     # Train/Test Distribution Plot
-    logger.info("Generating Train/Test Distribution Plot...")
     train_stats = train_df_full['Method'].value_counts().rename('Train')
     test_stats = test_df['Method'].value_counts().rename('Test')
     dist_df = pd.concat([train_stats, test_stats], axis=1).fillna(0)
@@ -204,237 +166,35 @@ def run_classification_benchmark(db_path, aim_run, workers=4, seed=42, run_type=
     ax_dist.set_xticklabels(dist_df.index, rotation=45, ha='right', fontsize=11)
     ax_dist.legend(fontsize=11)
     
-    for bars in [bars1, bars2]:
-        for bar in bars:
-            yval = bar.get_height()
-            if yval > 0:
-                ax_dist.text(bar.get_x() + bar.get_width()/2, yval + (dist_df['Train'].max() * 0.01), 
-                             f"{int(yval)}", ha='center', va='bottom', fontsize=9, fontweight='bold')
-                
     fig_dist.tight_layout()
     dist_plot_path = os.path.join(plots_dir, "train_test_distribution.png")
     fig_dist.savefig(dist_plot_path, dpi=300, bbox_inches='tight')
-    
-    # Save to aim
     aim_run.track(Image(fig_dist), name="train_test_distribution", context={"task": "classification", "run_type": run_type})
     plt.close(fig_dist)
 
     loao_results = {}
-    loao_feature_importances = {}
     loao_global_results = {}
+    all_test_preds = []
 
     for holdout in poisoners:
         logger.info(f"🚀 Training Classification Model: [BLIND TO {holdout.upper()}]")
         train_df = train_df_full[train_df_full['Method'] != holdout]
+        train_df = train_df[~((train_df['Is_Poisoned'] == 1) & (train_df['Rate'] <= 0.05))]
         X_train, y_train = train_df[feature_cols], train_df['Is_Poisoned']
         X_test = test_df[feature_cols]
         
         scale_weight = len(y_train[y_train==0]) / max(1, len(y_train[y_train==1]))
-        clf = XGBClassifier(
-            n_estimators=200, learning_rate=0.05, max_depth=6, 
-            scale_pos_weight=scale_weight, random_state=seed, 
-            eval_metric='auc', n_jobs=workers
-        )
+        clf = TabPFNClassifier(n_estimators=200, balance_probabilities=True)
         clf.fit(X_train, y_train)
-        loao_feature_importances[holdout] = clf.feature_importances_
         
         test_df_copy = test_df.copy()
-        test_df_copy['Prediction'] = clf.predict(X_test)
-        
-        global_acc = accuracy_score(test_df_copy['Is_Poisoned'], test_df_copy['Prediction'])
-        loao_global_results[holdout] = global_acc
-        
-        method_accs = {}
-        for method in all_methods:
-            mask = test_df_copy['Method'] == method
-            if mask.sum() > 0:
-                acc = accuracy_score(test_df_copy.loc[mask, 'Is_Poisoned'], test_df_copy.loc[mask, 'Prediction'])
-                method_accs[method] = acc
-            else:
-                method_accs[method] = 0.0
-                
-        loao_results[holdout] = method_accs
-        logger.info(f"   => Zero-Shot Accuracy on {holdout}: {method_accs.get(holdout, 0):.2%}\n")
-
-    # Generate Massive Master Plot
-    sns.set_theme(style="whitegrid")
-    num_plots = len(poisoners)
-    cols = 3
-    rows = int(np.ceil(num_plots / cols))
-    
-    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 5 * rows), squeeze=False)
-    axes = axes.flatten()
-    
-    for idx, holdout in enumerate(poisoners):
-        ax = axes[idx]
-        accs = [loao_results[holdout].get(m, 0) for m in all_methods]
-        colors = ['#e74c3c' if m == holdout else '#2ecc71' if m == 'clean' else '#3498db' for m in all_methods]
-            
-        bars = ax.bar(all_methods, accs, color=colors, edgecolor='black', linewidth=0.5)
-        ax.set_title(f"Model Trained WITHOUT '{holdout}'", fontsize=12, fontweight='bold')
-        ax.set_ylim(0, 1.1)
-        ax.set_ylabel("Detection Accuracy", fontsize=10)
-        ax.set_xticks(range(len(all_methods)))
-        ax.set_xticklabels(all_methods, rotation=45, ha='right', fontsize=9)
-        
-        for bar in bars:
-            yval = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2, yval + 0.02, f"{yval:.2f}", 
-                    ha='center', va='bottom', fontsize=9, fontweight='bold')
-
-    for idx in range(num_plots, len(axes)): fig.delaxes(axes[idx])
-    plt.tight_layout()
-    plot_path = os.path.join(plots_dir, "loao_master_grid.png")
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-    aim_run.track(Image(fig), name="loao_master_grid", context={"task": "classification", "run_type": run_type})
-    plt.close(fig)
-
-    # Target-Centric Plot
-    rows2 = int(np.ceil(len(all_methods) / cols))
-    fig2, axes2 = plt.subplots(rows2, cols, figsize=(6 * cols, 5 * rows2), squeeze=False)
-    axes2 = axes2.flatten()
-
-    for idx, test_target in enumerate(all_methods):
-        ax = axes2[idx]
-        accs = [loao_results[omitted].get(test_target, 0) for omitted in poisoners]
-        colors = ['#e74c3c' if omitted == test_target else '#3498db' for omitted in poisoners]
-        if test_target == 'clean': colors = ['#2ecc71'] * len(poisoners)
-
-        bars = ax.bar(poisoners, accs, color=colors, edgecolor='black', linewidth=0.5)
-
-        if test_target == 'clean':
-            global_accs = [loao_global_results[omitted] for omitted in poisoners]
-            ax.plot(range(len(poisoners)), global_accs, color='darkorange', marker='o', 
-                    linestyle='-', linewidth=2, markersize=6, label='Global Model Accuracy')
-            ax.legend(loc='lower left', fontsize=9)
-        
-        ax.set_title(f"Accuracy on '{test_target}'", fontsize=12, fontweight='bold')
-        ax.set_ylim(0, 1.1)
-        ax.set_ylabel("Detection Accuracy", fontsize=10)
-        ax.set_xlabel("Method Omitted During Training", fontsize=10)
-        ax.set_xticks(range(len(poisoners)))
-        ax.set_xticklabels(poisoners, rotation=45, ha='right', fontsize=9)
-        for bar in bars:
-            yval = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2, yval + 0.02, f"{yval:.2f}", ha='center', va='bottom', fontsize=9, fontweight='bold')
-
-    for idx in range(len(all_methods), len(axes2)): fig2.delaxes(axes2[idx])
-    fig2.tight_layout()
-    fig2.savefig(os.path.join(plots_dir, "loao_target_evolution_grid.png"), dpi=300, bbox_inches='tight')
-    aim_run.track(Image(fig2), name="target_centric", context={"task": "classification", "run_type": run_type})
-    plt.close(fig2)
-
-    # Feature Importances Plot
-    fig3, axes3 = plt.subplots(rows, cols, figsize=(6 * cols, 5 * rows), squeeze=False)
-    axes3 = axes3.flatten()
-
-    for idx, holdout in enumerate(poisoners):
-        ax = axes3[idx]
-        importances = loao_feature_importances[holdout]
-        feat_imp = pd.Series(importances, index=feature_cols).sort_values(ascending=True).tail(10)
-        bars = feat_imp.plot(kind='barh', ax=ax, color='#9b59b6', edgecolor='black', linewidth=0.5)
-        ax.set_title(f"Top 10 Features (Without '{holdout}')", fontsize=12, fontweight='bold')
-        ax.set_xlabel("Feature Importance Score", fontsize=10)
-        ax.set_xlim(0, feat_imp.max() * 1.25)
-        for i, v in enumerate(feat_imp):
-            ax.text(v + (feat_imp.max() * 0.02), i, f"{v:.3f}", va='center', fontsize=9, fontweight='bold')
-
-    for idx in range(len(poisoners), len(axes3)): fig3.delaxes(axes3[idx])
-    fig3.tight_layout()
-    fig3.savefig(os.path.join(plots_dir, "loao_feature_importances_grid.png"), dpi=300, bbox_inches='tight')
-    aim_run.track(Image(fig3), name="loao_feature_importances_grid", context={"task": "classification", "run_type": run_type})
-    plt.close(fig3)
-
-
-# ==============================================================================
-# 2. Contrastive Metric Benchmark (From evaluate_contrastive.py)
-# ==============================================================================
-def run_contrastive_benchmark(db_path, aim_run, workers=4, seed=42, epochs=30, run_type="all_features"):
-    logger.info(f"--- Starting Contrastive LOAO Benchmark [{run_type.upper()}] ---")
-
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Using device: {device}")
-
-    plots_dir = f"data/plots_loao_contrastive_{run_type}"
-    os.makedirs(plots_dir, exist_ok=True)
-    
-    df = pd.read_csv(db_path)
-    df['BaseGroup'] = df['Data'].apply(extract_base_dataset_name)
-    
-    drop_cols = ['Data', 'Path', 'Method', 'Rate', 'Is_Poisoned', 'error', 'BaseGroup']
-    drop_cols += [c for c in df.columns if c in ['Train.Clean', 'Test.Clean', 'Train.Poison', 'Test.Poison']]
-    feature_cols = [c for c in df.columns if c not in drop_cols]
-    
-    if run_type == "complexity_only":
-        complexity_bases = MFE.valid_metafeatures(groups=["complexity"])
-        feature_cols = [c for c in feature_cols if c.split('.')[0] in complexity_bases]
-        
-    df[feature_cols] = df[feature_cols].fillna(0)
-    
-    poisoners = sorted([m for m in df['Method'].unique() if m != 'clean'])
-    all_methods = sorted(list(df['Method'].unique()))
-
-    alfa_df = df[df['Method'] == 'alfa_svm']
-    other_df = df[df['Method'] != 'alfa_svm']
-    if len(alfa_df) > 0:
-        alfa_kept = alfa_df.sample(frac=0.5, random_state=42)
-        df = pd.concat([other_df, alfa_kept]).reset_index(drop=True)
-
-    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
-    train_idx, test_idx = next(gss.split(df[feature_cols], df['Is_Poisoned'], df['BaseGroup']))
-    
-    train_df_full = df.iloc[train_idx].copy()
-    test_df = df.iloc[test_idx].copy()
-    
-    loao_results = {}
-    loao_global_results = {}
-    loao_test_embeddings = {}
-
-    for holdout in poisoners:
-        logger.info(f"🚀 Training Metric Model: [BLIND TO {holdout.upper()}]")
-        
-        train_df = train_df_full[train_df_full['Method'] != holdout]
-        
-        scaler = MinMaxScaler()
-        X_train = scaler.fit_transform(train_df[feature_cols].values)
-        y_train = train_df['Is_Poisoned'].values
-        groups_train = train_df['BaseGroup'].values
-        
-        X_test = scaler.transform(test_df[feature_cols].values)
-        
-        dataset = TripletMetaDataset(X_train, y_train, groups_train, samples_per_epoch=2000)
-        loader = DataLoader(dataset, batch_size=64, shuffle=True, num_workers=workers if device.type == 'cpu' else 0)
-        
-        model = MetricEmbeddingNet(input_dim=len(feature_cols), embed_dim=32).to(device)
-        
-        criterion = nn.TripletMarginLoss(margin=0.4, p=2) 
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-        
-        model.train()
-        for epoch in range(epochs):
-            for a, p, n in loader:
-                a, p, n = a.to(device), p.to(device), n.to(device)
-                optimizer.zero_grad()
-                loss = criterion(model(a), model(p), model(n))
-                loss.backward()
-                optimizer.step()
-                
-        model.eval()
-        with torch.no_grad():
-            X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
-            X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
-            emb_train = model(X_train_t).cpu().numpy()
-            emb_test = model(X_test_t).cpu().numpy()
-            
-        # FIX: Replaced KNN with a Balanced SVM.
-        # KNN fails when one class outnumbers the other 8-to-1 in density.
-        clf = SVC(kernel='rbf', class_weight='balanced', random_state=seed)
-        clf.fit(emb_train, y_train)
-        
-        test_df_copy = test_df.copy()
-        test_df_copy['Prediction'] = clf.predict(emb_test)
+        #test_df_copy['Prediction'] = clf.predict(X_test)
+        optimal_threshold = 0.35
+        test_df_copy['Prediction_Prob'] = clf.predict_proba(X_test)[:, 1]
+        test_df_copy['Prediction'] = (test_df_copy['Prediction_Prob'] >= optimal_threshold).astype(int)
+        test_df_copy['Prediction_Prob'] = clf.predict_proba(X_test)[:, 1]
+        test_df_copy['Holdout'] = holdout
+        all_test_preds.append(test_df_copy)
         
         global_acc = accuracy_score(test_df_copy['Is_Poisoned'], test_df_copy['Prediction'])
         loao_global_results[holdout] = global_acc
@@ -448,88 +208,258 @@ def run_contrastive_benchmark(db_path, aim_run, workers=4, seed=42, epochs=30, r
                 method_accs[method] = 0.0
                 
         loao_results[holdout] = method_accs
-        loao_test_embeddings[holdout] = (emb_test, test_df_copy['Method'].values)
-        logger.info(f"   => Zero-Shot Accuracy on {holdout}: {method_accs.get(holdout, 0):.2%} (Global: {global_acc:.2%})\n")
+        logger.info(f"   => Zero-Shot Accuracy on {holdout}: {method_accs.get(holdout, 0):.2%}\n")
 
-    # Generate Target-Centric Plot
-    sns.set_theme(style="whitegrid")
+    # Threshold Selection Plot
+    combined_preds = pd.concat(all_test_preds)
+    precisions, recalls, thresholds = precision_recall_curve(
+        combined_preds['Is_Poisoned'], combined_preds['Prediction_Prob']
+    )
+    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-9)
+    best_idx = np.argmax(f1_scores)
+    best_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
     
-    cols = 3
-    # Use len(all_methods) to ensure 'clean' gets its own subplot
-    rows2 = int(np.ceil(len(all_methods) / cols))
-    fig2, axes2 = plt.subplots(rows2, cols, figsize=(6 * cols, 5 * rows2), squeeze=False)
-    axes2 = axes2.flatten()
+    fig_thresh, ax_thresh = plt.subplots(figsize=(10, 6))
+    ax_thresh.plot(thresholds, precisions[:-1], label='Precision', color='#2ecc71', linewidth=2)
+    ax_thresh.plot(thresholds, recalls[:-1], label='Recall', color='#e74c3c', linewidth=2)
+    ax_thresh.plot(thresholds, f1_scores[:-1], label='F1 Score', color='#3498db', linewidth=2, linestyle='--')
+    ax_thresh.axvline(x=best_threshold, color='black', linestyle=':', label=f'Best F1 Threshold ({best_threshold:.2f})')
+    ax_thresh.set_title(f"Performance vs. Decision Threshold ({run_type.upper()})", fontsize=14, fontweight='bold')
+    ax_thresh.set_xlabel("Decision Threshold", fontsize=12)
+    ax_thresh.set_ylabel("Score", fontsize=12)
+    ax_thresh.set_xlim(0, 1)
+    ax_thresh.set_ylim(0, 1.05)
+    ax_thresh.legend(loc='lower left')
+    plt.tight_layout()
+    fig_thresh.savefig(os.path.join(plots_dir, "threshold_selection.png"), dpi=300, bbox_inches='tight')
+    aim_run.track(Image(fig_thresh), name="threshold_selection", context={"task": "classification", "run_type": run_type})
+    plt.close(fig_thresh)
+
+    # =========================================================================
+    # NEW: Plots for Model Trained on ALL Data (where Holdout == 'None')
+    # =========================================================================
+    preds_all_train = combined_preds[combined_preds['Holdout'] == 'None'].copy()
+    benign_methods = ['clean', 'feature_noise_svm']
     
-    for idx, test_target in enumerate(all_methods):
-        ax = axes2[idx]
-        accs = [loao_results[omitted].get(test_target, 0) for omitted in poisoners]
+    if not preds_all_train.empty:
+        # --- Plot 1: Accuracy on All Methods (Poisoners + Clean/Noise) ---
+        method_accs_all = []
+        for method in all_methods:
+            mask = preds_all_train['Method'] == method
+            if mask.sum() > 0:
+                acc = accuracy_score(preds_all_train.loc[mask, 'Is_Poisoned'], preds_all_train.loc[mask, 'Prediction'])
+                method_accs_all.append({'Method': method, 'Accuracy': acc})
         
-        colors = ['#e74c3c' if omitted == test_target else '#3498db' for omitted in poisoners]
-        if test_target == 'clean': 
-            colors = ['#2ecc71'] * len(poisoners)
+        df_accs_all = pd.DataFrame(method_accs_all)
+        
+        # Custom palette: Green for benign datasets, Red for poisoners
+        custom_palette = {m: '#2ecc71' if m in benign_methods else '#e74c3c' for m in df_accs_all['Method']}
+        
+        fig_all, ax_all = plt.subplots(figsize=(10, 6))
+        sns.barplot(data=df_accs_all, x='Method', y='Accuracy', ax=ax_all, palette=custom_palette, hue='Method', legend=False)
+        ax_all.set_title(f"Accuracy of Model Trained on ALL Data ({run_type.upper()})\n(Green = Benign, Red = Poisoner)", fontsize=14, fontweight='bold')
+        ax_all.set_ylim(0, 1.1)
+        ax_all.set_ylabel("Accuracy", fontsize=12)
+        ax_all.set_xlabel("Test Method", fontsize=12)
+        ax_all.set_xticklabels(ax_all.get_xticklabels(), rotation=45, ha='right')
+        
+        # Annotate exact accuracy on top of the bars
+        for p in ax_all.patches:
+            ax_all.annotate(f"{p.get_height():.2f}", 
+                            (p.get_x() + p.get_width() / 2., p.get_height()),
+                            ha='center', va='center', xytext=(0, 5), 
+                            textcoords='offset points', fontsize=9, fontweight='bold')
+        
+        plt.tight_layout()
+        fig_all.savefig(os.path.join(plots_dir, "accuracy_all_train_per_method.png"), dpi=300)
+        aim_run.track(Image(fig_all), name="accuracy_all_train_per_method", context={"task": "classification", "run_type": run_type})
+        plt.close(fig_all)
 
-        bars = ax.bar(poisoners, accs, color=colors, edgecolor='black', linewidth=0.5)
+        # --- Plot 2: Accuracy per Poisoner broken down by Rate ---
+        # Filter out ALL benign methods since they don't have a meaningful poisoning rate
+        poison_preds = preds_all_train[~preds_all_train['Method'].isin(benign_methods)].copy()
         
-        # Add the Global Model Accuracy curve on top of the 'clean' bar chart
-        if test_target == 'clean':
-            global_accs = [loao_global_results[omitted] for omitted in poisoners]
-            ax.plot(range(len(poisoners)), global_accs, color='darkorange', marker='o', 
-                    linestyle='-', linewidth=2, markersize=6, label='Global Model Accuracy')
-            ax.legend(loc='lower left', fontsize=9)
-
-        ax.set_title(f"Target Accuracy: '{test_target}'", fontsize=12, fontweight='bold')
-        ax.set_ylim(0, 1.1)
-        ax.set_ylabel("Detection Accuracy", fontsize=10)
-        ax.set_xlabel("Method Omitted During Training", fontsize=10)
-        ax.set_xticks(range(len(poisoners)))
-        ax.set_xticklabels(poisoners, rotation=45, ha='right', fontsize=9)
-        
-        for bar in bars:
-            yval = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2, yval + 0.02, f"{yval:.2f}", ha='center', va='bottom', fontsize=9, fontweight='bold')
-
-    for idx in range(len(all_methods), len(axes2)): 
-        fig2.delaxes(axes2[idx])
-        
-    fig2.tight_layout()
-    target_plot_path = os.path.join(plots_dir, "loao_target_centric_grid.png")
-    fig2.savefig(target_plot_path, dpi=300, bbox_inches='tight')
-    aim_run.track(Image(fig2), name="target_centric", context={"task": "contrastive", "run_type": run_type})
-    plt.close(fig2)
-
-    # Generate PCA Plots
-    rows = int(np.ceil(len(poisoners) / cols))
-    fig_pca, axes_pca = plt.subplots(rows, cols, figsize=(6 * cols, 5 * rows), squeeze=False)
-    axes_pca = axes_pca.flatten()
-    
-    for idx, holdout in enumerate(poisoners):
-        ax = axes_pca[idx]
-        emb_test, test_methods = loao_test_embeddings[holdout]
-        
-        pca = PCA(n_components=2, random_state=seed)
-        emb_2d = pca.fit_transform(emb_test)
-        
-        clean_mask = test_methods == 'clean'
-        holdout_mask = test_methods == holdout
-        seen_poison_mask = (~clean_mask) & (~holdout_mask)
-        
-        ax.scatter(emb_2d[seen_poison_mask, 0], emb_2d[seen_poison_mask, 1], c='#3498db', alpha=0.5, label='Seen Poisons', edgecolors='k', s=40)
-        ax.scatter(emb_2d[clean_mask, 0], emb_2d[clean_mask, 1], c='#2ecc71', alpha=0.8, label='Clean Data', edgecolors='k', s=40, marker='s')
-        ax.scatter(emb_2d[holdout_mask, 0], emb_2d[holdout_mask, 1], c='#e74c3c', alpha=1.0, label=f'Unseen ({holdout})', edgecolors='k', s=100, marker='*')
-        
-        ax.set_title(f"Test Embeddings (Blind to '{holdout}')", fontsize=12, fontweight='bold')
-        ax.set_xticks([])
-        ax.set_yticks([])
-        if idx == 0: ax.legend(loc='best', fontsize=9)
+        if not poison_preds.empty:
+            rate_accs = []
+            for (method, rate), group in poison_preds.groupby(['Method', 'Rate']):
+                acc = accuracy_score(group['Is_Poisoned'], group['Prediction'])
+                rate_accs.append({'Method': method, 'Rate': rate, 'Accuracy': acc})
+                
+            df_rate_accs = pd.DataFrame(rate_accs)
             
-    for idx in range(len(poisoners), len(axes_pca)): fig_pca.delaxes(axes_pca[idx])
-    fig_pca.tight_layout()
-    plt.savefig(os.path.join(plots_dir, "loao_metric_embeddings_pca.png"), dpi=300, bbox_inches='tight')
-    aim_run.track(Image(fig_pca), name="contrastive_pca_embeddings", context={"task": "contrastive", "run_type": run_type})
-    plt.close(fig_pca)
+            # Using grouped barplot for clarity (x=Rate, hue=Method)
+            fig_rate, ax_rate = plt.subplots(figsize=(14, 6))
+            sns.barplot(data=df_rate_accs, x='Rate', y='Accuracy', hue='Method', ax=ax_rate, palette='tab10')
+            
+            ax_rate.set_title(f"Accuracy by Poisoning Rate (Model Trained on ALL Data) - {run_type.upper()}", fontsize=14, fontweight='bold')
+            ax_rate.set_ylim(0, 1.1)
+            ax_rate.set_ylabel("Accuracy", fontsize=12)
+            ax_rate.set_xlabel("Poisoning Rate", fontsize=12)
+            
+            # Place legend outside so it doesn't block the bars
+            plt.legend(title='Poisoning Method', bbox_to_anchor=(1.02, 1), loc='upper left', borderaxespad=0.)
+            plt.tight_layout()
+            
+            fig_rate.savefig(os.path.join(plots_dir, "accuracy_all_train_by_rate.png"), dpi=300)
+            aim_run.track(Image(fig_rate), name="accuracy_all_train_by_rate", context={"task": "classification", "run_type": run_type})
+            plt.close(fig_rate)
+    # =========================================================================
+
+    # Use Standardized Target-Centric Grid Plotting
+    plot_target_centric(
+        loao_results, loao_global_results, all_methods, poisoners, 
+        metric_name='Accuracy', plots_dir=plots_dir, task_name='classification', 
+        run_type=run_type, aim_run=aim_run, y_limit=1.1
+    )
+
+def run_multiclass_ood_benchmark(db_path, aim_run, workers=4, seed=42, run_type="all_features"):
+    """
+    Multi-Class + OOD Detection Paradigm.
+    Identifies specific attack signatures and flags unseen zero-day attacks using an OOD threshold.
+    """
+    logger.info(f"--- Starting Multi-Class OOD Benchmark [{run_type.upper()}] ---")
+
+    plots_dir = f"data/plots_loao_multiclass_ood_{run_type}"
+    os.makedirs(plots_dir, exist_ok=True)
+    
+    # 1. Load Data
+    train_df_full, test_df, feature_cols, poisoners, all_methods = prepare_benchmark_data(
+        db_path, run_type, seed, split_target='Method'
+    )
+    
+    # Ensure benign datasets are grouped correctly for multi-class
+    train_df_full['Method'] = train_df_full['Method'].replace('feature_noise_svm', 'clean')
+    test_df['Method'] = test_df['Method'].replace('feature_noise_svm', 'clean')
+    
+    # Update poisoners list to exclude the newly grouped benign method
+    poisoners = sorted([m for m in train_df_full['Method'].unique() if m != 'clean'])
+
+    ood_results = []
+    
+    for holdout in poisoners:
+        logger.info(f"🚀 Training Multi-Class OOD Model: [ZERO-DAY HOLDOUT: {holdout.upper()}]")
+        
+        # 2. Prepare Training Data (Blind to the holdout attack)
+        train_df = train_df_full[train_df_full['Method'] != holdout]
+        
+        # Encode string labels to integers for XGBoost
+        le = LabelEncoder()
+        y_train_encoded = le.fit_transform(train_df['Method'])
+        X_train = train_df[feature_cols]
+        
+        X_test = test_df[feature_cols]
+        y_test_true = test_df['Method']
+        
+        # 3. Train Multi-Class Classifier
+        # Using XGBoost here as it scales beautifully to multi-class probabilities natively
+        clf = XGBClassifier(
+            n_estimators=200, 
+            learning_rate=0.05, 
+            max_depth=6, 
+            objective='multi:softprob',
+            random_state=seed, 
+            n_jobs=workers
+        )
+        clf.fit(X_train, y_train_encoded)
+        
+        # 4. Extract Probabilities and Confidence (Maximum Softmax Probability)
+        test_probs = clf.predict_proba(X_test)
+        max_probs = np.max(test_probs, axis=1) # The "Confidence" score
+        raw_preds = le.inverse_transform(np.argmax(test_probs, axis=1))
+        
+        test_df_copy = test_df.copy()
+        test_df_copy['Max_Prob'] = max_probs
+        test_df_copy['Raw_Prediction'] = raw_preds
+        test_df_copy['Is_Zero_Day'] = (test_df_copy['Method'] == holdout).astype(int)
+        
+        # 5. Determine OOD Threshold dynamically 
+        # (e.g., 5th percentile of the training set's confidence to allow 5% False OOD rate)
+        train_probs = clf.predict_proba(X_train)
+        train_max_probs = np.max(train_probs, axis=1)
+        ood_threshold = np.percentile(train_max_probs, 5) 
+        
+        # 6. Apply Threshold: If confidence is below threshold, flag as OOD
+        test_df_copy['Final_Prediction'] = np.where(
+            test_df_copy['Max_Prob'] < ood_threshold, 
+            'OOD_ZERO_DAY', 
+            test_df_copy['Raw_Prediction']
+        )
+        
+        # 7. Evaluate Performance
+        # --- A. Multi-class Accuracy on Known Classes ---
+        known_mask = test_df_copy['Is_Zero_Day'] == 0
+        known_acc = accuracy_score(
+            test_df_copy.loc[known_mask, 'Method'], 
+            test_df_copy.loc[known_mask, 'Final_Prediction']
+        )
+        
+        # --- B. Zero-Day Detection Rate (True Positive Rate for OOD) ---
+        zero_day_mask = test_df_copy['Is_Zero_Day'] == 1
+        zero_day_detection_rate = (test_df_copy.loc[zero_day_mask, 'Final_Prediction'] == 'OOD_ZERO_DAY').mean()
+        
+        # --- C. OOD AUROC (Threshold-independent ability to separate known vs unknown) ---
+        # Note: AUROC expects a higher score for the positive class. Since Max_Prob is LOWER for OOD,
+        # we evaluate AUROC on (1 - Max_Prob) as the "OOD-ness" score.
+        ood_auc = roc_auc_score(test_df_copy['Is_Zero_Day'], 1 - test_df_copy['Max_Prob'])
+        
+        logger.info(f"   => Known Class Accuracy: {known_acc:.2%}")
+        logger.info(f"   => Zero-Day '{holdout}' Detection Rate: {zero_day_detection_rate:.2%} (Threshold: {ood_threshold:.2f})")
+        logger.info(f"   => OOD Separation AUROC: {ood_auc:.4f}\n")
+        
+        ood_results.append({
+            'Holdout': holdout,
+            'Known_Accuracy': known_acc,
+            'Zero_Day_Detection_Rate': zero_day_detection_rate,
+            'OOD_AUROC': ood_auc
+        })
+
+        # 8. Plot OOD Confidence Distribution
+        sns.set_theme(style="whitegrid")
+        fig, ax = plt.subplots(figsize=(8, 5))
+        
+        sns.kdeplot(data=test_df_copy[known_mask], x="Max_Prob", fill=True, color="#3498db", label="Known Classes", ax=ax, clip=(0,1))
+        sns.kdeplot(data=test_df_copy[zero_day_mask], x="Max_Prob", fill=True, color="#e74c3c", label=f"Zero-Day ({holdout})", ax=ax, clip=(0,1))
+        
+        ax.axvline(x=ood_threshold, color='black', linestyle=':', linewidth=2, label=f'OOD Threshold ({ood_threshold:.2f})')
+        
+        ax.set_title(f"OOD Confidence Distribution (Holdout: {holdout})", fontsize=14, fontweight='bold')
+        ax.set_xlabel("Maximum Softmax Probability (Confidence)", fontsize=12)
+        ax.set_ylabel("Density", fontsize=12)
+        ax.set_xlim(0, 1.05)
+        ax.legend(loc='upper left')
+        
+        plt.tight_layout()
+        fig_path = os.path.join(plots_dir, f"ood_dist_{holdout}.png")
+        fig.savefig(fig_path, dpi=300)
+        aim_run.track(Image(fig), name=f"ood_dist_{holdout}", context={"task": "multiclass_ood", "run_type": run_type})
+        plt.close(fig)
+
+    # 9. Global Summary Plot
+    results_df = pd.DataFrame(ood_results)
+    
+    fig_summary, ax_summary = plt.subplots(figsize=(12, 6))
+    x = np.arange(len(results_df['Holdout']))
+    width = 0.4
+    
+    ax_summary.bar(x - width/2, results_df['Known_Accuracy'], width, label='Known Class Acc', color='#2ecc71', edgecolor='black')
+    ax_summary.bar(x + width/2, results_df['Zero_Day_Detection_Rate'], width, label='Zero-Day Detection Rate', color='#e74c3c', edgecolor='black')
+    
+    ax_summary.plot(x, results_df['OOD_AUROC'], color='#9b59b6', marker='o', linestyle='-', linewidth=2, markersize=8, label='OOD AUROC')
+    
+    ax_summary.set_title(f"Multi-Class OOD Benchmark Summary ({run_type.upper()})", fontsize=14, fontweight='bold')
+    ax_summary.set_ylabel("Score", fontsize=12)
+    ax_summary.set_xticks(x)
+    ax_summary.set_xticklabels(results_df['Holdout'], rotation=45, ha='right', fontsize=10)
+    ax_summary.set_ylim(0, 1.1)
+    ax_summary.legend(loc='lower left')
+    
+    plt.tight_layout()
+    fig_summary.savefig(os.path.join(plots_dir, "ood_global_summary.png"), dpi=300)
+    aim_run.track(Image(fig_summary), name="ood_global_summary", context={"task": "multiclass_ood", "run_type": run_type})
+    plt.close(fig_summary)
 
 # ==============================================================================
-# 3. Regression Benchmark (From evaluate_regression.py)
+# 3. Regression Benchmark
 # ==============================================================================
 def run_regression_benchmark(db_path, aim_run, workers=4, seed=42, run_type="all_features"):
     logger.info(f"--- Starting LOAO Regression Benchmark [{run_type.upper()}] ---")
@@ -537,53 +467,15 @@ def run_regression_benchmark(db_path, aim_run, workers=4, seed=42, run_type="all
     plots_dir = f"data/plots_loao_regression_{run_type}"
     os.makedirs(plots_dir, exist_ok=True)
     
-    df = pd.read_csv(db_path)
-    df['BaseGroup'] = df['Data'].apply(extract_base_dataset_name)
-    
-    drop_cols = ['Data', 'Path', 'Method', 'Rate', 'Is_Poisoned', 'error', 'BaseGroup']
-    drop_cols += [c for c in df.columns if c in ['Train.Clean', 'Test.Clean', 'Train.Poison', 'Test.Poison']]
-    feature_cols = [c for c in df.columns if c not in drop_cols]
-    
-    if run_type == "complexity_only":
-        complexity_bases = MFE.valid_metafeatures(groups=["complexity"])
-        feature_cols = [c for c in feature_cols if c.split('.')[0] in complexity_bases]
-    
-    df[feature_cols] = df[feature_cols].fillna(0)
-    
-    poisoners = sorted([m for m in df['Method'].unique() if m != 'clean'])
-    all_methods = sorted(list(df['Method'].unique()))
-
-    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
-    train_idx, test_idx = next(gss.split(df[feature_cols], df['Rate'], df['BaseGroup']))
-    
-    train_df_full = df.iloc[train_idx].copy()
-    test_df = df.iloc[test_idx].copy()
-    
-    # Train/Test Dist
-    train_stats = train_df_full['Method'].value_counts().rename('Train')
-    test_stats = test_df['Method'].value_counts().rename('Test')
-    dist_df = pd.concat([train_stats, test_stats], axis=1).fillna(0)
-    
-    sns.set_theme(style="whitegrid")
-    fig_dist, ax_dist = plt.subplots(figsize=(12, 6))
-    x = np.arange(len(dist_df.index))
-    width = 0.35
-    
-    bars1 = ax_dist.bar(x - width/2, dist_df['Train'], width, label='Train Subset', color='#3498db', edgecolor='black')
-    bars2 = ax_dist.bar(x + width/2, dist_df['Test'], width, label='Test Subset', color='#e74c3c', edgecolor='black')
-    
-    ax_dist.set_title(f'Regression Dataset Composition ({run_type.upper()})', fontsize=14, fontweight='bold')
-    ax_dist.set_xticks(x)
-    ax_dist.set_xticklabels(dist_df.index, rotation=45, ha='right', fontsize=11)
-    ax_dist.legend(fontsize=11)
-    fig_dist.tight_layout()
-    fig_dist.savefig(os.path.join(plots_dir, "train_test_distribution.png"), dpi=300, bbox_inches='tight')
-    aim_run.track(Image(fig_dist), name="regression_train_test_distribution", context={"task": "regression", "run_type": run_type})
-    plt.close(fig_dist)
+    # Use centralized data preparation (note we split on Rate instead for regression)
+    train_df_full, test_df, feature_cols, poisoners, all_methods = prepare_benchmark_data(
+        db_path, run_type, seed, split_target='Rate'
+    )
 
     loao_results = {}
     loao_feature_importances = {}
     loao_global_results = {}
+    all_test_preds = []
 
     for holdout in poisoners:
         logger.info(f"🚀 Training Regression Model: [BLIND TO {holdout.upper()}]")
@@ -598,6 +490,8 @@ def run_regression_benchmark(db_path, aim_run, workers=4, seed=42, run_type="all
         
         test_df_copy = test_df.copy()
         test_df_copy['Prediction'] = np.clip(clf.predict(X_test), a_min=0.0, a_max=None)
+        test_df_copy['Holdout'] = holdout
+        all_test_preds.append(test_df_copy)
         
         global_mae = mean_absolute_error(test_df_copy['Rate'], test_df_copy['Prediction'])
         loao_global_results[holdout] = global_mae
@@ -616,119 +510,42 @@ def run_regression_benchmark(db_path, aim_run, workers=4, seed=42, run_type="all
     max_mae_observed = max([max(maes.values()) for maes in loao_results.values()])
     y_limit = max_mae_observed * 1.2
 
-    # Master Plot
-    sns.set_theme(style="whitegrid")
-    num_plots = len(poisoners)
-    cols = 3
-    rows = int(np.ceil(num_plots / cols))
-    
-    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 5 * rows), squeeze=False)
-    axes = axes.flatten()
-    
-    for idx, holdout in enumerate(poisoners):
-        ax = axes[idx]
-        maes = [loao_results[holdout].get(m, 0) for m in all_methods]
-        colors = ['#e74c3c' if m == holdout else '#2ecc71' if m == 'clean' else '#3498db' for m in all_methods]
-            
-        bars = ax.bar(all_methods, maes, color=colors, edgecolor='black', linewidth=0.5)
-        ax.set_title(f"Model Trained WITHOUT '{holdout}'", fontsize=12, fontweight='bold')
-        ax.set_ylim(0, y_limit)
-        ax.set_xticklabels(all_methods, rotation=45, ha='right', fontsize=9)
-        
-        for bar in bars:
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + (y_limit * 0.02), f"{bar.get_height():.3f}", ha='center', va='bottom', fontsize=9, fontweight='bold')
-
-    for idx in range(num_plots, len(axes)): fig.delaxes(axes[idx])
-    plt.tight_layout()
-    fig.savefig(os.path.join(plots_dir, "loao_master_grid_mae.png"), dpi=300, bbox_inches='tight')
-    aim_run.track(Image(fig), name="regression_master_grid_mae", context={"task": "regression", "run_type": run_type})
-    plt.close(fig)
-
-    # Target-Centric
-    rows2 = int(np.ceil(len(all_methods) / cols))
-    fig2, axes2 = plt.subplots(rows2, cols, figsize=(6 * cols, 5 * rows2), squeeze=False)
-    axes2 = axes2.flatten()
-
-    for idx, test_target in enumerate(all_methods):
-        ax = axes2[idx]
-        maes = [loao_results[omitted].get(test_target, 0) for omitted in poisoners]
-        colors = ['#e74c3c' if omitted == test_target else '#3498db' for omitted in poisoners]
-        if test_target == 'clean': colors = ['#2ecc71'] * len(poisoners)
-
-        bars = ax.bar(poisoners, maes, color=colors, edgecolor='black', linewidth=0.5)
-        if test_target == 'clean':
-            ax.plot(range(len(poisoners)), [loao_global_results[omitted] for omitted in poisoners], color='darkorange', marker='o', linewidth=2, label='Global MAE')
-            ax.legend(loc='upper left', fontsize=9)
-
-        ax.set_title(f"MAE on '{test_target}'", fontsize=12, fontweight='bold')
-        ax.set_ylim(0, y_limit)
-        ax.set_xticklabels(poisoners, rotation=45, ha='right', fontsize=9)
-        for bar in bars:
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + (y_limit * 0.02), f"{bar.get_height():.3f}", ha='center', va='bottom', fontsize=9, fontweight='bold')
-
-    for idx in range(len(all_methods), len(axes2)): fig2.delaxes(axes2[idx])
-    fig2.tight_layout()
-    fig2.savefig(os.path.join(plots_dir, "loao_target_evolution_grid_mae.png"), dpi=300, bbox_inches='tight')
-    aim_run.track(Image(fig2), name="target_centric", context={"task": "regression", "run_type": run_type})
-    plt.close(fig2)
-
-    # Feature Importances
-    fig3, axes3 = plt.subplots(rows, cols, figsize=(6 * cols, 5 * rows), squeeze=False)
-    axes3 = axes3.flatten()
-
-    for idx, holdout in enumerate(poisoners):
-        ax = axes3[idx]
-        feat_imp = pd.Series(loao_feature_importances[holdout], index=feature_cols).sort_values(ascending=True).tail(10)  
-        bars = feat_imp.plot(kind='barh', ax=ax, color='#9b59b6', edgecolor='black', linewidth=0.5)
-        ax.set_title(f"Top 10 Features (Without '{holdout}')", fontsize=12, fontweight='bold')
-        ax.set_xlim(0, feat_imp.max() * 1.25)
-        for i, v in enumerate(feat_imp):
-            ax.text(v + (feat_imp.max() * 0.02), i, f"{v:.3f}", va='center', fontsize=9, fontweight='bold')
-
-    for idx in range(len(poisoners), len(axes3)): fig3.delaxes(axes3[idx])
-    fig3.tight_layout()
-    fig3.savefig(os.path.join(plots_dir, "loao_feature_importances_grid_reg.png"), dpi=300, bbox_inches='tight')
-    aim_run.track(Image(fig3), name="regression_feature_importances", context={"task": "regression", "run_type": run_type})
-    plt.close(fig3)
+    # Use Standardized Target-Centric Grid Plotting (Dynamic upper limit and labels handle MAE properly)
+    plot_target_centric(
+        loao_results, loao_global_results, all_methods, poisoners, 
+        metric_name='MAE', plots_dir=plots_dir, task_name='regression', 
+        run_type=run_type, aim_run=aim_run, y_limit=y_limit
+    )
 
 # ==============================================================================
 # Main Execution
 # ==============================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Unified LOAO Evaluator (Classification, Contrastive, Regression)")
-    parser.add_argument("metalearner", choices=["classification", "contrastive", "regression"], help="Type of metalearner to train")
-    parser.add_argument("--db_path", type=str, default="data/meta_db_universal.csv", help="Path to your populated MetaDB")
+    parser = argparse.ArgumentParser(description="Unified LOAO Evaluator")
+    parser.add_argument("metalearner", choices=["classification", "regression", "multiclass"], help="Type of metalearner to train")
+    parser.add_argument("--db_path", type=str, default="data_2/meta_db_universal.csv", help="Path to your populated MetaDB")
     parser.add_argument("--workers", type=int, default=4, help="CPU/DataLoader workers")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--epochs", type=int, default=60, help="Contrastive Training Epochs")
-    parser.add_argument("--filtered", type = str, default = None, help="Feature filtering")
+    parser.add_argument("--filtered", type=str, default=None, help="Feature filtering")
     parser.add_argument("--description", type=str, default="Meta-Learner Training Run", help="Aim run description")
     
     args = parser.parse_args()
 
-    # Initialize aim Run
     aim_run = Run(experiment="LOAO_Unified_Benchmarks")
     aim_run["hparams"] = vars(args)
 
     try:
-        if args.filtered is None:
-            logger.info("========== RUNNING ALL FEATURES ==========")
-            if args.metalearner == "classification" :
-                run_classification_benchmark(args.db_path, aim_run, args.workers, args.seed, run_type="all_features")
-            elif args.metalearner == "contrastive" :
-                run_contrastive_benchmark(args.db_path, aim_run, args.workers, args.seed, args.epochs, run_type="all_features")
-            elif args.metalearner == "regression" :
-                run_regression_benchmark(args.db_path, aim_run, args.workers, args.seed, run_type="all_features")
+        run_type = "complexity_only" if args.filtered == "complexity" else "all_features"
+        logger.info(f"========== RUNNING {run_type.upper().replace('_', ' ')} ==========")
         
-        elif args.filtered == "complexity" :
-            logger.info("========== RUNNING COMPLEXITY ONLY ==========")
-            if args.metalearner == "classification" :
-                run_classification_benchmark(args.db_path, aim_run, args.workers, args.seed, run_type="complexity_only")
-            elif args.metalearner == "contrastive" :
-                run_contrastive_benchmark(args.db_path, aim_run, args.workers, args.seed, args.epochs, run_type="complexity_only")
-            elif args.metalearner == "regression" :
-                run_regression_benchmark(args.db_path, aim_run, args.workers, args.seed, run_type="complexity_only")
-        
+        if args.metalearner == "classification":
+            run_classification_benchmark(args.db_path, aim_run, args.workers, args.seed, run_type)
+        elif args.metalearner == "regression":
+            run_regression_benchmark(args.db_path, aim_run, args.workers, args.seed, run_type)
+        elif args.metalearner == "multiclass":
+            run_multiclass_ood_benchmark(args.db_path, aim_run, args.workers, args.seed, run_type)
+            
     except Exception as e:
         logger.error(f"Unified LOAO Benchmark failed: {e}", exc_info=True)
     finally:

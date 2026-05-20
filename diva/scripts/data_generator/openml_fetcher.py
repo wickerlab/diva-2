@@ -106,7 +106,7 @@ def fetch_openml_datasets(n_max, folder, max_retries=3, db_path=None):
                 if X_dense.shape[0] > target_samples:
                     X_dense, y = resample(X_dense, y, n_samples=target_samples, stratify=y, random_state=42)
 
-                X_scaled = StandardScaler().fit_transform(X_num)
+                X_scaled = StandardScaler().fit_transform(X_dense)
                 y_binary = pd.factorize(y)[0]
                 
                 df = pd.DataFrame(X_scaled, columns=[f"feature_{i}" for i in range(X_scaled.shape[1])], dtype=np.float32)

@@ -10,30 +10,21 @@ from pathlib import Path
 from scripts.base_poisoner import BasePoisoner
 from scripts.utils.utils import to_csv
 
-# ==========================================
-# 1. The Generative Autoencoder Architecture
-# ==========================================
-class SimpleAE(nn.Module):
+class ResidualAE(nn.Module):
     def __init__(self):
-        super(SimpleAE, self).__init__()
-        # Encoder: 32x32 -> 16x16 -> 8x8
-        self.encoder = nn.Sequential(
+        super(ResidualAE, self).__init__()
+        # No MaxPool! We preserve spatial resolution to keep it sharp and fast.
+        self.net = nn.Sequential(
             nn.Conv2d(3, 16, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.Conv2d(16, 16, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-        # Decoder: 8x8 -> 16x16 -> 32x32
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2),
-            nn.ReLU(),
-            nn.ConvTranspose2d(16, 3, kernel_size=2, stride=2)
+            nn.Conv2d(16, 3, kernel_size=3, padding=1),
+            nn.Tanh() # Binds output between -1 and 1
         )
 
     def forward(self, x):
-        return self.decoder(self.encoder(x))
+        return self.net(x)
 
 # ==========================================
 # 2. The Poisoner Class
@@ -74,7 +65,8 @@ class AutoEncoderPoisoner(BasePoisoner):
         with torch.no_grad():
             for i in range(0, len(X_images), 128):
                 batch = X_images[i:i+128].to(self.device)
-                clean_latents.append(self.latent_extractor(batch).squeeze())
+                # FIX: Use flatten(1) instead of squeeze()
+                clean_latents.append(self.latent_extractor(batch).flatten(1)) 
         clean_latents = torch.cat(clean_latents)
         
         linear_head = nn.Linear(512, 2).to(self.device)
@@ -124,50 +116,89 @@ class AutoEncoderPoisoner(BasePoisoner):
                 adv_weight = 0.5 
 
                 # --- TRAIN & GENERATE: Class 0 -> Confuse as Class 1 ---
+                # --- TRAIN & GENERATE: Class 0 -> Confuse as Class 1 ---
                 if len(base_idx_0) > 0:
-                    ae_0 = SimpleAE().to(self.device)
-                    opt_ae_0 = optim.Adam(ae_0.parameters(), lr=0.005)
+                    ae_0 = ResidualAE().to(self.device)
+                    opt_ae_0 = optim.Adam(ae_0.parameters(), lr=0.01) # Slightly higher LR for faster convergence
                     b_images_0 = X_images[base_idx_0].to(self.device)
-                    target_labels_1 = torch.ones(len(b_images_0), dtype=torch.long, device=self.device) # Target Class 1
+                    target_labels_1 = torch.ones(len(b_images_0), dtype=torch.long, device=self.device)
+                    
+                    EPSILON = 0.15 # Strict bound on perturbation magnitude
+                    adv_weight = 1.0 
                     
                     ae_0.train()
-                    for epoch in range(100): # 100 epochs is enough for a tiny CAE
+                    for epoch in range(100):
                         opt_ae_0.zero_grad()
-                        p_images = ae_0(b_images_0)
                         
-                        loss_recon = criterion_mse(p_images, b_images_0)
+                        # 1. Generate Noise and scale/clip it to be strictly stealthy
+                        raw_noise = ae_0(b_images_0)
+                        noise = torch.clamp(raw_noise, min=-EPSILON, max=EPSILON)
+                        
+                        # 2. Add noise to original image (Residual mapping)
+                        p_images = b_images_0 + noise
+                        
+                        # 3. New Loss: Minimize noise magnitude while maximizing confusion
+                        loss_recon = torch.mean(noise ** 2) 
                         loss_adv = criterion_ce(victim_model(p_images), target_labels_1)
                         
                         loss = loss_recon + (adv_weight * loss_adv)
                         loss.backward()
                         opt_ae_0.step()
                         
+                        # 4. EARLY STOPPING FOR SPEED
+                        if epoch % 5 == 0:
+                            with torch.no_grad():
+                                preds = victim_model(p_images).argmax(dim=1)
+                                success_rate = (preds == target_labels_1).float().mean()
+                                if success_rate > 0.95:
+                                    break # Stop training early if attack is already highly successful
+                        
                     ae_0.eval()
                     with torch.no_grad():
-                        X_final_images[base_idx_0] = ae_0(b_images_0).cpu()
+                        final_noise = torch.clamp(ae_0(b_images_0), min=-EPSILON, max=EPSILON)
+                        X_final_images[base_idx_0] = (b_images_0 + final_noise).cpu()
 
                 # --- TRAIN & GENERATE: Class 1 -> Confuse as Class 0 ---
                 if len(base_idx_1) > 0:
-                    ae_1 = SimpleAE().to(self.device)
-                    opt_ae_1 = optim.Adam(ae_1.parameters(), lr=0.005)
+                    ae_1 = ResidualAE().to(self.device)
+                    opt_ae_1 = optim.Adam(ae_1.parameters(), lr=0.01) # Slightly higher LR for faster convergence
                     b_images_1 = X_images[base_idx_1].to(self.device)
-                    target_labels_0 = torch.zeros(len(b_images_1), dtype=torch.long, device=self.device) # Target Class 0
+                    target_labels_0 = torch.zeros(len(b_images_1), dtype=torch.long, device=self.device)
+                    
+                    EPSILON = 0.15 # Strict bound on perturbation magnitude
+                    adv_weight = 1.0 
                     
                     ae_1.train()
                     for epoch in range(100):
                         opt_ae_1.zero_grad()
-                        p_images = ae_1(b_images_1)
                         
-                        loss_recon = criterion_mse(p_images, b_images_1)
+                        # 1. Generate Noise and scale/clip it to be strictly stealthy
+                        raw_noise = ae_1(b_images_1)
+                        noise = torch.clamp(raw_noise, min=-EPSILON, max=EPSILON)
+                        
+                        # 2. Add noise to original image (Residual mapping)
+                        p_images = b_images_1 + noise
+                        
+                        # 3. New Loss: Minimize noise magnitude while maximizing confusion
+                        loss_recon = torch.mean(noise ** 2) 
                         loss_adv = criterion_ce(victim_model(p_images), target_labels_0)
                         
                         loss = loss_recon + (adv_weight * loss_adv)
                         loss.backward()
                         opt_ae_1.step()
                         
+                        # 4. EARLY STOPPING FOR SPEED
+                        if epoch % 5 == 0:
+                            with torch.no_grad():
+                                preds = victim_model(p_images).argmax(dim=1)
+                                success_rate = (preds == target_labels_0).float().mean()
+                                if success_rate > 0.95:
+                                    break # Stop training early if attack is already highly successful
+                        
                     ae_1.eval()
                     with torch.no_grad():
-                        X_final_images[base_idx_1] = ae_1(b_images_1).cpu()
+                        final_noise = torch.clamp(ae_1(b_images_1), min=-EPSILON, max=EPSILON)
+                        X_final_images[base_idx_1] = (b_images_1 + final_noise).cpu()
                 
                 y_final = y_labels.clone()
 
@@ -180,7 +211,8 @@ class AutoEncoderPoisoner(BasePoisoner):
             with torch.no_grad():
                 for i in range(0, len(X_final_images), 128):
                     batch = X_final_images[i:i+128].to(self.device)
-                    feats = self.latent_extractor(batch).squeeze()
+                    # FIX: Use flatten(1) instead of squeeze()
+                    feats = self.latent_extractor(batch).flatten(1)
                     latent_vectors.append(feats.cpu())
                     
             X_tabular = torch.cat(latent_vectors).numpy()
