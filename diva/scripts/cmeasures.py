@@ -7,17 +7,9 @@ import concurrent.futures
 
 from tqdm import tqdm
 from pymfe.mfe import MFE
-
 import pyarrow.csv as pv
 
 logger = logging.getLogger("CMeasures")
-
-def chunkify(lst, n_chunks):
-    """Split list into roughly equal chunks."""
-    n_chunks = max(1, n_chunks)
-    k = max(1, len(lst) // n_chunks)
-    return [lst[i:i + k] for i in range(0, len(lst), k)]
-
 
 def table_to_numpy(table):
     """
@@ -28,97 +20,68 @@ def table_to_numpy(table):
     return np.column_stack(cols)
 
 
-def _extract_batch(batch):
-    """
-    Process a batch of files inside a single worker.
-    """
-    features = batch[0][1]
-    results = []
-
-    if features is None:
-        mfe = MFE(groups=["complexity"], random_state=42)
-    else:
-        mfe = MFE(features=features, random_state=42)
-
-    for file_path, _ in batch:
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-
-                table = pv.read_csv(
-                    file_path,
-                    read_options=pv.ReadOptions(use_threads=True),
-                    parse_options=pv.ParseOptions(delimiter=","),
-                )
-
-                data = table_to_numpy(table)
-
-                if data.shape[0] == 0:
-                    continue
-
-                X = data[:, :-1].astype(np.float32, copy=False)
-                y = data[:, -1]
-
-                # Early pruning (cheap checks)
-                if X.shape[0] >= 20000 or X.shape[1] >= 10000:
-                    continue
-
-                # Normalize labels
-                y = np.where(y == -1, 0, y)
-
-                # Compute MFE
-                mfe.fit(X, y)
-                f, v = mfe.extract()
-
-                res = {"Path": file_path}
-                res.update(dict(zip(f, v)))
-                results.append(res)
-
-        except Exception as e:
-            logger.error(f"Error extracting from {file_path}: {e}")
-
-    return results
-
-
 def _extract_single(args):
+    """
+    Process a single file using fast PyArrow reading and early pruning.
+    """
     file_path, features, groups = args
+    
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            data = pd.read_csv(file_path)
-            X, y = data.iloc[:, :-1].values, data.iloc[:, -1].values
-            if len(X) >= 20000:
+            
+            # Fast CSV reading with PyArrow instead of Pandas
+            table = pv.read_csv(
+                file_path,
+                read_options=pv.ReadOptions(use_threads=True),
+                parse_options=pv.ParseOptions(delimiter=","),
+            )
+
+            data = table_to_numpy(table)
+
+            if data.shape[0] == 0:
                 return None
-            if len(X[0]) >= 10000:
+
+            X = data[:, :-1].astype(np.float32, copy=False)
+            y = data[:, -1]
+
+            # Early pruning (cheap checks to skip massive datasets)
+            if X.shape[0] >= 20000 or X.shape[1] >= 10000:
                 return None
+
+            # Normalize labels
             y = np.where(y == -1, 0, y)
 
+            # Initialize MFE
             if features is not None:
                 mfe = MFE(features=features, random_state=42)
             else:
                 mfe = MFE(groups=groups, random_state=42)
 
+            # Compute MFE
             mfe.fit(X, y)
             f, v = mfe.extract()
 
         res = {"Path": file_path}
         res.update(dict(zip(f, v)))
         return res
+        
     except Exception as e:
         logger.error(f"Error extracting from {file_path}: {e}")
         return None
 
-def compute_cmeasures(file_paths, features=None, workers=None, db_path=None):
+
+def compute_cmeasures(file_paths, features=None, groups=None, workers=None, db_path=None):
     """
-    Compute PyMFE complexity measures in parallel (optimized).
+    Compute PyMFE complexity measures in parallel.
 
     - Uses PyArrow for fast CSV reading
-    - Uses batching to reduce process overhead
+    - Processes each file individually (no batching)
     - Skips already processed files if DB provided
     """
-
     paths_to_process = file_paths
 
+    # Check for existing records in the database
     if db_path and os.path.exists(db_path):
         try:
             existing_paths = set(
@@ -142,22 +105,28 @@ def compute_cmeasures(file_paths, features=None, workers=None, db_path=None):
 
     logger.info(f"Processing {len(paths_to_process)} files with {workers} workers...")
 
-    batches = chunkify([(p, features) for p in paths_to_process], workers * 2)
+    # Default groups if neither features nor groups are specified
+    if features is None and groups is None:
+        groups = ["complexity", "model-based", "landmarking"]
 
+    # Prepare arguments for single-file processing
+    args_list = [(p, features, groups) for p in paths_to_process]
     results = []
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(_extract_batch, b) for b in batches]
+        # Submit single files instead of batches
+        futures = [executor.submit(_extract_single, arg) for arg in args_list]
 
         with tqdm(total=len(futures), desc="C-Measures") as pbar:
             for future in concurrent.futures.as_completed(futures):
                 try:
-                    batch_result = future.result()
-                    if batch_result:
-                        results.extend(batch_result)
+                    result = future.result()
+                    # Only append if a valid dictionary was returned (not None)
+                    if result:
+                        results.append(result)
                 except Exception as e:
-                    logger.error(f"Batch failed: {e}")
-
+                    logger.error(f"Task failed: {e}")
+                
                 pbar.update(1)
 
     if not results:
@@ -189,7 +158,7 @@ def add_new_measures_to_db(db_path, groups, workers=None):
 
     # Calculate batch size dynamically based on workers
     actual_workers = workers if workers is not None else (os.cpu_count() or 4)
-    batch_size = 3 * actual_workers
+    batch_size = 4 * actual_workers
 
     # Set 'Path' as index so we can update specific rows easily
     df.set_index('Path', inplace=True)
