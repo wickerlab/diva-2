@@ -276,9 +276,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Meta-Database Utility Toolkit")
     parser.add_argument("action", choices=["sync", "stats", "add_measure"], help="Action to perform: 'sync' filesystem to DB, get DB 'stats', or 'add_measure' new PyMFE groups")
     
-    # --- Modality and Overrides ---
-    parser.add_argument("--modality", type=str, required=True, choices=[e.value for e in TaskModality], help="The core task modality to process.")
-    parser.add_argument("--db_path", type=str, default=None, help="Override path to master DB")
+    parser.add_argument("--db_path", type=str, default="meta_db_universal", help="Override path to master DB")
     
     # Args for sync and extraction
     parser.add_argument("--folders", nargs='+', default=["data/clean_data", "data/poisoned_data"], help="Folders to scan for sync")
@@ -286,17 +284,14 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Determine correct path from configuration
-    config = MODALITY_CONFIG[TaskModality(args.modality)]
-    db_path = args.db_path if args.db_path else config["db_path"]
 
     if args.action == "sync":
-        sync_filesystem_to_metadb(db_path, folders_to_scan=args.folders, workers=args.workers)
+        sync_filesystem_to_metadb(args.db_path, folders_to_scan=args.folders, workers=args.workers)
     elif args.action == "stats":
-        print_db_statistics(db_path)
+        print_db_statistics(args.db_path)
     elif args.action == "add_measure":
         add_new_measures_to_db(
-            db_path=db_path,
+            db_path=args.db_path,
             groups=["model-based", "landmarking"],
             workers=args.workers
         )

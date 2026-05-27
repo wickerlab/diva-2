@@ -33,8 +33,7 @@ class PoisonFrogsPoisoner(BasePoisoner):
         
         metadata_list = []
 
-        for i in advx_range:
-            rate = i/2
+        for rate in advx_range:
             path_poison_data = f'{path_output_base}_poison_frogs_{rate:.2f}.csv'
             
             if os.path.exists(path_poison_data):
@@ -42,7 +41,7 @@ class PoisonFrogsPoisoner(BasePoisoner):
                 metadata_list.append({"Data": dataname, "Path": path_poison_data, "Method": self.name, "Rate": rate, "Is_Poisoned": 1 if rate > 0 else 0})
                 continue
                 
-            n_poison = int(len(X_images) * rate)
+            n_poison = int(len(X_images) * rate/2)
 
             if n_poison == 0:
                 X_final_images = X_images

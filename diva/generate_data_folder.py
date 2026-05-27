@@ -172,19 +172,19 @@ def main():
     # ---------------------------------------------------------
     # 1. Synthetic Data (Tabular Binary)
     # ---------------------------------------------------------
-    """logger.info(f"--- Generating {n_synthetic} Synthetic Tabular Datasets ---")
+    logger.info(f"--- Generating {n_synthetic} Synthetic Tabular Datasets ---")
     synthetic_files = generate_synthetic_data(n_synthetic, base_folder)
     apply_attacks_to_files(
         files=synthetic_files, 
         modality=TaskModality.TABULAR_BINARY, 
         n_attacks=n_attacks_per_dataset, 
         base_folder=base_folder
-    )"""
+    )
     
     # ---------------------------------------------------------
     # 2. OpenML Data (Tabular Binary)
     # ---------------------------------------------------------
-    """logger.info(f"--- Fetching {n_openml} OpenML Tabular Datasets ---")
+    logger.info(f"--- Fetching {n_openml} OpenML Tabular Datasets ---")
     openml_files = fetch_openml_datasets(
         n_max=n_openml, 
         folder=base_folder, 
@@ -196,7 +196,7 @@ def main():
         modality=TaskModality.TABULAR_BINARY, 
         n_attacks=n_attacks_per_dataset, 
         base_folder=base_folder
-    )"""
+    )
     
     # ---------------------------------------------------------
     # 3. HF Image Data (Image Binary)
