@@ -12,8 +12,6 @@ data
 data_2
 build/
 split
-results
-result
 develop-eggs/
 dist/
 downloads/
@@ -42,7 +40,6 @@ pip-log.txt
 pip-delete-this-directory.txt
 
 # Unit test / coverage reports
-results/
 htmlcov/
 .tox/
 .nox/
@@ -61,7 +58,6 @@ logs/
 
 # Test data
 memento_cache
-results
 memento.sqlite
 output
 
