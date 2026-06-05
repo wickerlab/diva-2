@@ -7,29 +7,8 @@ from pathlib import Path
 import logging
 import matplotlib.pyplot as plt
 import seaborn as sns
-from enum import Enum
 import math
 from scripts.cmeasures import compute_cmeasures, add_new_measures_to_db
-
-# ==========================================
-# Task Modality Configuration
-# ==========================================
-class TaskModality(str, Enum):
-    TABULAR_BINARY = "tabular_binary"
-    IMAGE_BINARY = "image_binary"
-    IMAGE_MULTICLASS = "image_multiclass"
-
-MODALITY_CONFIG = {
-    TaskModality.TABULAR_BINARY: {
-        "db_path": "data/meta_db_universal.csv",
-    },
-    TaskModality.IMAGE_BINARY: {
-        "db_path": "data/meta_db_universal.csv",
-    },
-    TaskModality.IMAGE_MULTICLASS: {
-        "db_path": "data/meta_db_universal.csv",
-    }
-}
 
 logger = logging.getLogger("MetaDB")
 
@@ -276,7 +255,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Meta-Database Utility Toolkit")
     parser.add_argument("action", choices=["sync", "stats", "add_measure"], help="Action to perform: 'sync' filesystem to DB, get DB 'stats', or 'add_measure' new PyMFE groups")
     
-    parser.add_argument("--db_path", type=str, default="meta_db_universal", help="Override path to master DB")
+    parser.add_argument("--db_path", type=str, default="meta_db_universal.csv", help="Override path to master DB")
     
     # Args for sync and extraction
     parser.add_argument("--folders", nargs='+', default=["data/clean_data", "data/poisoned_data"], help="Folders to scan for sync")

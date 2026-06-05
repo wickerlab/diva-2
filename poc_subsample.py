@@ -19,8 +19,6 @@ from scripts.poisoner.svm_randomlabelflip.svm_randomlabelflip_generate_metadb im
 from scripts.poisoner.svm_alfa.svm_alfa_generate_metadb import AlfaPoisoner
 from scripts.poisoner.svm_feature_collision.svm_featurecollision import FeatureCollisionPoisoner
 
-# Suppress warnings for cleaner output
-warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("Top20SubsampleDetector")
 
@@ -74,6 +72,7 @@ def fetch_and_save_clean_dataset(did):
         X, y, _, _ = dataset.get_data(target=target)
         
         X_num = X.select_dtypes(include=[np.number]).fillna(0)
+        X_num = X_num.loc[:, X_num.std() > 0]
         if X_num.shape[1] == 0:
             logger.warning(f"Dataset {did} has no numeric features. Skipping.")
             return None
@@ -97,25 +96,12 @@ def apply_random_attack(clean_path, method, rate):
     poisoner_cls = POISONER_MAP[method]
     poisoner = poisoner_cls(base_folder=BASE_FOLDER)
     
-    # Identify pre-existing files to detect the newly generated file
-    base_name = os.path.splitext(os.path.basename(clean_path))[0]
-    search_pattern = os.path.join(BASE_FOLDER, "**", f"*{base_name}*.csv")
-    files_before = set(glob.glob(search_pattern, recursive=True))
-    
-    poisoner.apply_poisoning(clean_path, [rate])
-    
-    files_after = set(glob.glob(search_pattern, recursive=True))
-    new_files = list(files_after - files_before)
-    
-    if not new_files:
-        raise FileNotFoundError(f"Failed to locate {method} output for {base_name}.")
-        
-    # Sort to get the most recently created target file 
-    new_files.sort(key=os.path.getmtime)
-    return new_files[-1]
+    metadata = poisoner.apply_poisoning(clean_path, [rate])
+    return metadata[0]["Path"]
 
 def extract_meta_features(X_chunk, y_chunk):
     """Extracts PyMFE features for a single chunk."""
+    print(f"Extracting for {len(X_chunk)} points of {len(X_chunk[0])} features.")
     mfe = MFE(groups=MFE_GROUPS, random_state=42)
     mfe.fit(X_chunk, y_chunk)
     features, values = mfe.extract()
