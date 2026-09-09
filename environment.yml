@@ -1,0 +1,7 @@
+name: diva
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - ipykernel
+prefix: /home/gabriel/miniconda3/envs/diva
